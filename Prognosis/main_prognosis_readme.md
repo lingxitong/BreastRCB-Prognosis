@@ -1,18 +1,21 @@
 # main_prognosis.py 使用说明
 
-基于 MambaMIL 预后逻辑的单脚本工具，支持**训练**（K 折 / 全量）与**推理**。
+基于 MambaMIL 预后逻辑的单脚本工具，支持**训练**（K 折 / 全量）与**推理**，并支持 **WSI 特征 + 临床信息的中期融合**。
 
 核心建模逻辑：
 - **离散时间生存建模**：将事件时间按未删失样本的分位数离散成 `n_bins` 个区间，模型输出每个区间的 hazard，`S = cumprod(1 - hazard)`，风险分 `risk = -∑S`。
 - **损失**：NLL 生存损失（NLLSurvLoss）。
 - **评价指标**：Harrell c-index（`event = 1 - censorship`）。优先使用 `sksurv`，其次 `lifelines`，都没有时自动回退到内置 numpy 实现，**无需额外安装依赖**。
 - **多 slide 拼 bag**：一个患者（`case_id`）可能有多张 slide。训练时把多张 slide 的特征拼接成一个 bag，若 slide 数 `> max_slides_train` 则随机抽取该数量；**推理时拼接全部 slide**。
+- **临床中期融合**（默认开启）：MIL 聚合器得到 slide 级全局表征后，与编码后的临床向量融合，再输入生存预测头。
 
 ---
 
 ## 一、输入数据格式
 
-输入是一个 CSV，格式见 `Example_Dataset_Csv.csv`。关键列：
+输入是一个 CSV，格式见 `Example_Dataset_Csv.csv`。
+
+### 必需列
 
 | 列名 | 说明 |
 | --- | --- |
@@ -22,15 +25,60 @@
 | `OS_month` / `OS_status` | 总生存：时间（月）/ 状态（1=死亡事件，0=删失） |
 | `DFS_month` / `DFS_status` | 无病生存：时间 / 状态 |
 | `RFS_month` / `RFS_status` | 无复发生存：时间 / 状态 |
-| 其他列 | 临床/病理特征，当前脚本不使用，可保留 |
 
 约定：`*_status` 中 **1 = 事件发生（死亡/复发/进展），0 = 删失（censored）**；脚本内部 `censorship = 1 - status`。
+
+### 临床/病理列（`--use_clinical` 默认开启时使用）
+
+除 `case_id`、`slide_id`、`slide_feat_path` 以及 OS/DFS/RFS 的 month/status 列外，**其余列均作为临床特征**自动纳入模型，例如：
+
+| 类型 | 示例列 |
+| --- | --- |
+| 数值 | `Age`、`ER_pct_pre`、`Stage`、`MP`、`Tils` 等 |
+| 二值 0/1 | `ER_status`、`PR_status`、`Fibrosis`、`Necrosis` 等 |
+| 类别 | `HER2_score_pre`（如 `1+`）、`Molecular_subtype`（如 `LuminalB-`）等 |
+
+**编码规则**（在训练集上拟合，验证/推理复用）：
+- **数值列**：按训练集均值/标准差标准化；缺失值用训练集均值填充。
+- **类别列**：one-hot 编码；缺失值归为 `missing` 类。
+- 同一 `case_id` 多行 slide 时，临床信息取该患者第一条记录（各 slide 应一致）。
 
 `.h5` 文件中特征数据集默认键名为 `features`，形状为 `[N_patch, dim]`（可用 `--feat_key` 修改）。
 
 ---
 
-## 二、超参数说明
+## 二、模型结构（中期融合）
+
+```
+slide bag [N, in_dim]
+    ↓
+MIL 聚合器 (abmil / mean_mil / max_mil)
+    ↓
+全局表征 [1, hidden_dim]
+    ↓                          临床向量 [clinical_in_dim]
+    ↓                                ↓
+    └──────── fusion_type ──── 临床 MLP → 临床嵌入
+                    ↓
+              融合表征 [1, hidden_dim]
+                    ↓
+              生存 hazard 头 → n_classes
+```
+
+### 融合方式（`--fusion_type`）
+
+| 值 | 说明 |
+| --- | --- |
+| `concat`（默认） | 拼接 `[全局表征; 临床嵌入]` 后经 MLP |
+| `bilinear` | 双线性层 `Bilinear(全局, 临床)` + LayerNorm |
+| `gated` | 门控融合：`gate * proj(全局) + (1-gate) * proj(临床)` |
+
+关闭临床融合时使用 `--no-use_clinical`，模型退化为纯 WSI MIL 预后。
+
+> **注意**：临床中期融合目前仅支持内置模型 `abmil` / `mean_mil` / `max_mil`。`mamba_mil` / `trans_mil` / `s4model` 仅支持 `--no-use_clinical` 的纯 path 模式。
+
+---
+
+## 三、超参数说明
 
 ### 运行 / 路径
 
@@ -46,36 +94,45 @@
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--target` | `OS` | 训练目标，三选一：`OS` / `DFS` / `RFS`，自动选用对应 `*_month` / `*_status` 列 |
+| `--target` | `OS` | 训练目标，三选一：`OS` / `DFS` / `RFS` |
 | `--split_mode` | `kfold` | `kfold` K 折交叉验证 / `all_train` 全量训练 |
-| `--k` | `5` | K 折折数（按 `case_id` 划分，避免同一患者跨折泄漏） |
+| `--k` | `5` | K 折折数（按 `case_id` 划分） |
 
 ### 生存 / 训练超参
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--n_bins` | `4` | 离散时间区间数（即模型输出类别数 `n_classes`） |
+| `--n_bins` | `4` | 离散时间区间数（`n_classes`） |
 | `--max_epochs` | `50` | 每个 run 的训练轮数 |
 | `--lr` | `1e-4` | 学习率 |
-| `--reg` | `1e-5` | 权重衰减（weight decay） |
+| `--reg` | `1e-5` | 权重衰减 |
 | `--drop_out` | `0.25` | dropout 比例 |
-| `--gc` | `16` | 梯度累积步数（batch 固定为 1，bag 大小可变） |
-| `--alpha_surv` | `0.0` | NLL 生存损失中未删失样本的加权系数 |
+| `--gc` | `16` | 梯度累积步数 |
+| `--alpha_surv` | `0.0` | NLL 生存损失中未删失样本加权 |
 | `--seed` | `1` | 随机种子 |
 | `--opt` | `adam` | 优化器：`adam` / `sgd` |
 | `--num_workers` | `2` | DataLoader 进程数 |
 
-### 模型
+### 模型（MIL）
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--model_type` | `abmil` | `abmil` / `mean_mil` / `max_mil`（内置，开箱即用）；`mamba_mil` / `trans_mil` / `s4model`（从同级 `MambaMIL` 仓库动态加载，需相应依赖，如编译好的 `mamba_ssm`） |
-| `--in_dim` | `-1` | 特征维度，`<=0` 时从首个可用 `.h5` 自动推断 |
-| `--hidden_dim` | `512` | 隐藏层维度 |
-| `--max_slides_train` | `3` | 训练时单患者最多拼接的 slide 数，超过则随机采样 |
-| `--feat_key` | `features` | `.h5` 中特征数据集的键名 |
+| `--model_type` | `abmil` | `abmil` / `mean_mil` / `max_mil`（支持临床融合）；`mamba_mil` 等仅 path-only |
+| `--in_dim` | `-1` | WSI 特征维度，<=0 时从 h5 自动推断 |
+| `--hidden_dim` | `512` | MIL 全局表征维度；临床嵌入维度 = `max(32, hidden_dim//2)` |
+| `--max_slides_train` | `3` | 训练时单患者最多拼接 slide 数 |
+| `--feat_key` | `features` | h5 特征键名 |
 
-### MambaMIL 专用（仅 `--model_type mamba_mil` 时生效）
+### 临床中期融合
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--use_clinical` | 开启 | 使用 CSV 临床列；加 `--no-use_clinical` 关闭 |
+| `--fusion_type` | `concat` | 融合方式：`concat` / `bilinear` / `gated` |
+| `--clinical_hidden_dim` | `256` | 预留参数（当前实现中临床嵌入维由 `hidden_dim` 决定） |
+| `clinical_in_dim` | 自动 | 编码后临床向量总维度，训练时写入 `config.json`，无需手动指定 |
+
+### MambaMIL 专用（仅 `--model_type mamba_mil` 且 `--no-use_clinical`）
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
@@ -83,24 +140,42 @@
 | `--mambamil_rate` | `10` | SRMamba 的 rate |
 | `--mambamil_type` | `SRMamba` | `Mamba` / `BiMamba` / `SRMamba` |
 
-> **超参数 json 覆盖规则**：训练时解析出的超参会保存为 `log_root/exp_name/config.json`。若通过 `--config xxx.json` 指定，则其中的超参字段会**覆盖**命令行默认值（仅覆盖超参类字段；`csv_path` / `log_root` / `exp_name` / `mode` 等路径与模式参数仍以命令行为准）。
+> **超参数 json 覆盖规则**：训练时解析出的超参会保存为 `log_root/exp_name/config.json`。若通过 `--config xxx.json` 指定，则其中的超参字段会**覆盖**命令行默认值（路径/模式参数仍以命令行为准）。
 
 ---
 
-## 三、使用方式
+## 四、使用方式
 
 > 下文用 `PY=/home/chenwm/anaconda3/envs/pfm_seg/bin/python` 指代 Python 解释器。
 
-### 1. K 折交叉验证训练
+### 1. K 折 + 临床融合（默认 concat）
 
 ```bash
 $PY main_prognosis.py --mode train --split_mode kfold --target OS \
     --csv_path Example_Dataset_Csv.csv \
-    --log_root ./logs --exp_name os_kfold \
-    --k 5 --max_epochs 50
+    --log_root ./logs --exp_name os_pathomic_concat \
+    --fusion_type concat --k 5 --max_epochs 50
 ```
 
-### 2. 全量训练（all_train）
+### 2. 指定融合方式为 gated / bilinear
+
+```bash
+$PY main_prognosis.py --mode train --target DFS \
+    --csv_path Example_Dataset_Csv.csv \
+    --log_root ./logs --exp_name dfs_gated \
+    --fusion_type gated --model_type abmil
+```
+
+### 3. 仅 WSI，不使用临床信息
+
+```bash
+$PY main_prognosis.py --mode train --target OS \
+    --csv_path Example_Dataset_Csv.csv \
+    --log_root ./logs --exp_name os_path_only \
+    --no-use_clinical
+```
+
+### 4. 全量训练（all_train）
 
 ```bash
 $PY main_prognosis.py --mode train --split_mode all_train --target DFS \
@@ -108,7 +183,7 @@ $PY main_prognosis.py --mode train --split_mode all_train --target DFS \
     --log_root ./logs --exp_name dfs_all --max_epochs 50
 ```
 
-### 3. 用 json 覆盖超参数
+### 5. 用 json 覆盖超参数
 
 ```bash
 $PY main_prognosis.py --mode train --target RFS \
@@ -126,52 +201,60 @@ $PY main_prognosis.py --mode train --target RFS \
     "drop_out": 0.3,
     "n_bins": 4,
     "model_type": "abmil",
+    "fusion_type": "bilinear",
+    "use_clinical": true,
     "max_slides_train": 3
 }
 ```
 
-### 4. 推理
+### 6. 推理
 
-推理需要训练时保存的 `config.json`（提供模型结构超参）、权重路径、与训练同格式的 CSV，以及结果保存目录：
+推理需要：
+- 训练保存的 `config.json`（含 `use_clinical`、`fusion_type`、`clinical_in_dim` 等）
+- 与 checkpoint **同目录**下的 `clinical_encoder.json`（K 折时在各 `fold_i/` 下）
+- 与训练同格式的 CSV（含临床列）
+- 权重路径与结果目录
 
 ```bash
 $PY main_prognosis.py --mode infer \
-    --config ./logs/os_kfold/config.json \
-    --ckpt_path ./logs/os_kfold/fold_0/checkpoint_best.pt \
+    --config ./logs/os_pathomic_concat/config.json \
+    --ckpt_path ./logs/os_pathomic_concat/fold_0/checkpoint_best.pt \
     --csv_path test.csv \
     --save_infer_dir ./infer_os
 ```
 
+> 推理时会自动从 `checkpoint_best.pt` 所在目录加载 `clinical_encoder.json`。若找不到且 `use_clinical=true`，将回退为不使用临床特征。
+
 ---
 
-## 四、输出结果
+## 五、输出结果
 
 ### 训练（kfold）
 
 ```
 log_root/exp_name/
-├── config.json                # 本次训练的全部超参数
+├── config.json                # 全部超参数（含 fusion_type / clinical_in_dim）
 ├── kfold_summary.json         # k 个 best_epoch、各折/均值 val c-index
 ├── fold_0/
+│   ├── clinical_encoder.json  # 该折训练集拟合的临床编码器（数值均值/方差、类别词表）
 │   ├── metrics.csv            # 逐 epoch: train_loss / train_cindex / val_loss / val_cindex
-│   ├── history.json           # 同上（json 格式）
-│   ├── checkpoint_best.pt     # 该折 val c-index 最优权重
-│   └── checkpoint_last.pt     # 该折最后一轮权重
+│   ├── history.json
+│   ├── checkpoint_best.pt     # val c-index 最优权重
+│   └── checkpoint_last.pt
 ├── fold_1/ ...
 └── fold_{k-1}/ ...
 ```
-
-`kfold_summary.json` 关键字段：`best_epochs`（k 个最佳 epoch）、`val_cindex_per_fold`、`mean_val_cindex`、`std_val_cindex`。
 
 ### 训练（all_train）
 
 ```
 log_root/exp_name/
 ├── config.json
-├── all_train_summary.json     # 最低 train loss 的 epoch 及 loss
-├── metrics.csv / history.json # 逐 epoch loss / c-index
-├── checkpoint_best_loss.pt    # train loss 最低的权重
-└── checkpoint_last.pt         # 最后一轮权重
+├── clinical_encoder.json      # 全量训练集拟合的临床编码器
+├── all_train_summary.json
+├── metrics.csv / history.json
+├── checkpoint_best_loss.pt
+└── checkpoint_last.pt
 ```
 
 ### 推理
@@ -179,13 +262,14 @@ log_root/exp_name/
 ```
 save_infer_dir/
 ├── metrics.json               # n_cases / n_events / c_index / target 等
-└── risk_scores.csv            # 每个患者: case_id, risk_score, event_time, censorship, status
+└── risk_scores.csv            # case_id, risk_score, event_time, censorship, status
 ```
 
 ---
 
-## 五、依赖说明
+## 六、依赖说明
 
 - 必需：`torch`、`h5py`、`pandas`、`numpy`、`scikit-learn`。
-- 可选：`sksurv` 或 `lifelines`（用于 c-index）；若均未安装，脚本自动使用内置 numpy 实现，结果一致。
-- `mamba_mil` / `trans_mil` / `s4model` 需要同级 `MambaMIL` 仓库及其依赖（如编译好的 `mamba_ssm`）；默认 `abmil` 无需这些依赖即可运行。
+- 可选：`sksurv` 或 `lifelines`（用于 c-index）；若均未安装，脚本自动使用内置 numpy 实现。
+- 临床融合 + 内置 MIL（`abmil` 等）无需额外依赖。
+- `mamba_mil` / `trans_mil` / `s4model` 需要同级 `MambaMIL` 仓库及其依赖，且仅支持 `--no-use_clinical`。

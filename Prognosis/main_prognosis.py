@@ -117,7 +117,16 @@ HPARAM_KEYS = [
     "drop_out", "gc", "alpha_surv", "seed", "opt", "model_type", "in_dim",
     "hidden_dim", "max_slides_train", "feat_key", "num_workers",
     "mambamil_layer", "mambamil_rate", "mambamil_type",
+    "use_clinical", "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
 ]
+
+# 不参与临床编码的列：标识符、路径、生存标签
+META_COLS = {"case_id", "slide_id", "slide_feat_path"}
+SURVIVAL_COLS = {
+    "OS_month", "OS_status", "DFS_month", "DFS_status", "RFS_month", "RFS_status",
+}
+# 已知类别型临床列（其余 object/低基数列也会自动识别为类别）
+KNOWN_CATEGORICAL = {"HER2_score_pre", "Molecular_subtype"}
 
 
 # ============================================================================
@@ -147,9 +156,8 @@ def nll_surv_loss(hazards, S, Y, c, alpha=0.0, eps=1e-7):
 
 
 # ============================================================================
-# 模型：内置 ABMIL / Mean / Max（自包含，可直接运行）
-# 另支持从 MambaMIL 仓库动态加载 mamba_mil / trans_mil / s4model
-# 所有模型 forward(x[N, in_dim]) -> (hazards[1, C], S[1, C], logits[1, C])
+# 模型：MIL 聚合器 -> 全局表征；可选与临床特征中期融合 -> 生存头
+# fusion_type: concat / bilinear / gated
 # ============================================================================
 def _init_weights(module):
     for m in module.modules():
@@ -162,85 +170,176 @@ def _init_weights(module):
             nn.init.constant_(m.weight, 1.0)
 
 
-class ABMIL(nn.Module):
-    """Gated-Attention MIL（生存版本）。"""
+class ABMILBackbone(nn.Module):
+    """Gated-Attention MIL，输出 slide 级全局表征 [1, hidden]。"""
 
-    def __init__(self, in_dim, n_classes, dropout=0.25, hidden=512, att_dim=256):
+    def __init__(self, in_dim, dropout=0.25, hidden=512, att_dim=256):
         super().__init__()
+        self.hidden_dim = hidden
         self.fc = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(dropout)
         )
         self.attention_V = nn.Sequential(nn.Linear(hidden, att_dim), nn.Tanh())
         self.attention_U = nn.Sequential(nn.Linear(hidden, att_dim), nn.Sigmoid())
         self.attention_w = nn.Linear(att_dim, 1)
-        self.classifier = nn.Linear(hidden, n_classes)
         self.apply(_init_weights)
 
     def forward(self, x):
-        h = self.fc(x)                      # [N, hidden]
-        A = self.attention_w(self.attention_V(h) * self.attention_U(h))  # [N, 1]
-        A = torch.transpose(A, 1, 0)        # [1, N]
+        h = self.fc(x)
+        A = self.attention_w(self.attention_V(h) * self.attention_U(h))
+        A = torch.transpose(A, 1, 0)
         A = F.softmax(A, dim=1)
-        M = torch.mm(A, h)                  # [1, hidden]
-        logits = self.classifier(M)         # [1, n_classes]
-        hazards = torch.sigmoid(logits)
-        S = torch.cumprod(1 - hazards, dim=1)
-        return hazards, S, logits
+        return torch.mm(A, h)
 
 
-class MeanMaxMIL(nn.Module):
-    def __init__(self, in_dim, n_classes, dropout=0.25, hidden=512, pool="mean"):
+class MeanMaxBackbone(nn.Module):
+    def __init__(self, in_dim, dropout=0.25, hidden=512, pool="mean"):
         super().__init__()
+        self.hidden_dim = hidden
         self.fc = nn.Sequential(
             nn.Linear(in_dim, hidden), nn.ReLU(), nn.Dropout(dropout)
         )
-        self.classifier = nn.Linear(hidden, n_classes)
         self.pool = pool
         self.apply(_init_weights)
 
     def forward(self, x):
         h = self.fc(x)
-        h = h.mean(dim=0, keepdim=True) if self.pool == "mean" else h.max(dim=0, keepdim=True)[0]
-        logits = self.classifier(h)
+        return h.mean(dim=0, keepdim=True) if self.pool == "mean" else h.max(dim=0, keepdim=True)[0]
+
+
+class ConcatFusion(nn.Module):
+    def __init__(self, mil_dim, clin_dim, out_dim, dropout=0.25):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(mil_dim + clin_dim, out_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, mil_repr, clin_repr):
+        return self.net(torch.cat([mil_repr, clin_repr], dim=-1))
+
+
+class BilinearFusion(nn.Module):
+    def __init__(self, mil_dim, clin_dim, out_dim):
+        super().__init__()
+        self.bilinear = nn.Bilinear(mil_dim, clin_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, mil_repr, clin_repr):
+        return self.norm(F.relu(self.bilinear(mil_repr, clin_repr)))
+
+
+class GatedFusion(nn.Module):
+    """门控融合：根据 [全局表征; 临床嵌入] 学习逐维权重。"""
+
+    def __init__(self, mil_dim, clin_dim, out_dim):
+        super().__init__()
+        self.proj_mil = nn.Linear(mil_dim, out_dim)
+        self.proj_clin = nn.Linear(clin_dim, out_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(mil_dim + clin_dim, out_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, mil_repr, clin_repr):
+        gate = self.gate(torch.cat([mil_repr, clin_repr], dim=-1))
+        return gate * self.proj_mil(mil_repr) + (1.0 - gate) * self.proj_clin(clin_repr)
+
+
+def build_fusion(fusion_type, mil_dim, clin_dim, out_dim, dropout=0.25):
+    if fusion_type == "concat":
+        return ConcatFusion(mil_dim, clin_dim, out_dim, dropout)
+    if fusion_type == "bilinear":
+        return BilinearFusion(mil_dim, clin_dim, out_dim)
+    if fusion_type == "gated":
+        return GatedFusion(mil_dim, clin_dim, out_dim)
+    raise ValueError(f"未知 fusion_type: {fusion_type}，可选 concat/bilinear/gated")
+
+
+class PathomicSurvivalModel(nn.Module):
+    """
+    中期融合预后模型：
+      bag -> MIL backbone -> 全局表征
+      临床向量 -> MLP -> 临床嵌入
+      fusion(全局表征, 临床嵌入) -> 生存 hazard 头
+    """
+
+    def __init__(self, backbone, n_classes, clinical_in_dim, fusion_type,
+                 hidden_dim=512, dropout=0.25, use_clinical=True):
+        super().__init__()
+        self.backbone = backbone
+        self.use_clinical = use_clinical and clinical_in_dim > 0
+        mil_dim = backbone.hidden_dim
+
+        if self.use_clinical:
+            clin_emb_dim = max(32, hidden_dim // 2)
+            self.clinical_mlp = nn.Sequential(
+                nn.Linear(clinical_in_dim, clin_emb_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            self.fusion = build_fusion(fusion_type, mil_dim, clin_emb_dim, hidden_dim, dropout)
+            self.classifier = nn.Linear(hidden_dim, n_classes)
+        else:
+            self.classifier = nn.Linear(mil_dim, n_classes)
+        self.apply(_init_weights)
+
+    def forward(self, x, clinical=None):
+        bag_repr = self.backbone(x)
+        if self.use_clinical:
+            if clinical is None:
+                raise ValueError("use_clinical=True 时必须提供 clinical 特征")
+            clin = clinical.unsqueeze(0) if clinical.dim() == 1 else clinical
+            clin_emb = self.clinical_mlp(clin)
+            fused = self.fusion(bag_repr, clin_emb)
+            logits = self.classifier(fused)
+        else:
+            logits = self.classifier(bag_repr)
         hazards = torch.sigmoid(logits)
         S = torch.cumprod(1 - hazards, dim=1)
         return hazards, S, logits
 
 
-class RepoModelWrapper(nn.Module):
-    """包装 MambaMIL 仓库模型，统一 forward 输出为 (hazards, S, logits)。"""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, x):
-        # 仓库模型期望 [B, N, dim] 或 [N, dim]，返回 (hazards, S, Y_hat, A, results)
-        out = self.model(x)
-        hazards, S = out[0], out[1]
-        return hazards, S, hazards
+def build_backbone(cfg):
+    mt = cfg["model_type"]
+    if mt == "abmil":
+        return ABMILBackbone(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"])
+    if mt == "mean_mil":
+        return MeanMaxBackbone(cfg["in_dim"], dropout=cfg["drop_out"],
+                               hidden=cfg["hidden_dim"], pool="mean")
+    if mt == "max_mil":
+        return MeanMaxBackbone(cfg["in_dim"], dropout=cfg["drop_out"],
+                               hidden=cfg["hidden_dim"], pool="max")
+    if mt in ("mamba_mil", "trans_mil", "s4model"):
+        if cfg.get("use_clinical", True):
+            raise NotImplementedError(
+                f"临床中期融合暂不支持 model_type={mt}，请使用 abmil/mean_mil/max_mil，"
+                f"或设置 use_clinical=false"
+            )
+        return _build_repo_model(cfg)
+    raise NotImplementedError(f"未知 model_type: {mt}")
 
 
 def build_model(cfg, device):
-    mt = cfg["model_type"]
-    if mt == "abmil":
-        model = ABMIL(cfg["in_dim"], cfg["n_classes"], dropout=cfg["drop_out"],
-                      hidden=cfg["hidden_dim"])
-    elif mt == "mean_mil":
-        model = MeanMaxMIL(cfg["in_dim"], cfg["n_classes"], dropout=cfg["drop_out"],
-                           hidden=cfg["hidden_dim"], pool="mean")
-    elif mt == "max_mil":
-        model = MeanMaxMIL(cfg["in_dim"], cfg["n_classes"], dropout=cfg["drop_out"],
-                           hidden=cfg["hidden_dim"], pool="max")
-    elif mt in ("mamba_mil", "trans_mil", "s4model"):
-        model = _build_repo_model(cfg)
+    if cfg["model_type"] in ("mamba_mil", "trans_mil", "s4model") and not cfg.get("use_clinical", True):
+        model = build_backbone(cfg)
     else:
-        raise NotImplementedError(f"未知 model_type: {mt}")
+        backbone = build_backbone(cfg)
+        clinical_in_dim = int(cfg.get("clinical_in_dim", 0) or 0)
+        use_clinical = bool(cfg.get("use_clinical", True)) and clinical_in_dim > 0
+        model = PathomicSurvivalModel(
+            backbone, cfg["n_classes"], clinical_in_dim,
+            fusion_type=cfg.get("fusion_type", "concat"),
+            hidden_dim=cfg["hidden_dim"],
+            dropout=cfg["drop_out"],
+            use_clinical=use_clinical,
+        )
     return model.to(device)
 
 
 def _build_repo_model(cfg):
-    """从 MambaMIL 仓库动态构建模型（需要相应依赖，如已编译的 mamba_ssm）。"""
+    """从 MambaMIL 仓库动态构建模型（仅 path-only，无临床融合）。"""
     import sys
 
     repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "MambaMIL")
@@ -248,6 +347,16 @@ def _build_repo_model(cfg):
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     mt = cfg["model_type"]
+
+    class RepoSurvivalWrapper(nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.model = inner
+
+        def forward(self, x, clinical=None):
+            out = self.model(x)
+            return out[0], out[1], out[0]
+
     try:
         if mt == "mamba_mil":
             from models.MambaMIL import MambaMIL
@@ -259,16 +368,16 @@ def _build_repo_model(cfg):
             from models.TransMIL import TransMIL
             m = TransMIL(cfg["in_dim"], cfg["n_classes"], dropout=cfg["drop_out"],
                          act="relu", survival=True)
-        else:  # s4model
+        else:
             from models.S4MIL import S4Model
             m = S4Model(in_dim=cfg["in_dim"], n_classes=cfg["n_classes"], act="gelu",
                         dropout=cfg["drop_out"], survival=True)
     except Exception as e:
         raise RuntimeError(
-            f"无法从 MambaMIL 仓库加载模型 '{mt}'（可能缺少依赖，如编译版 mamba_ssm）。"
-            f"可改用内置 model_type=abmil。原始错误: {e}"
+            f"无法从 MambaMIL 仓库加载模型 '{mt}'（可能缺少依赖）。"
+            f"可改用 model_type=abmil。原始错误: {e}"
         )
-    return RepoModelWrapper(m)
+    return RepoSurvivalWrapper(m)
 
 
 # ============================================================================
@@ -297,8 +406,123 @@ def load_features(path, feat_key):
     return np.asarray(feats, dtype=np.float32)
 
 
+def get_clinical_columns(df):
+    return [c for c in df.columns if c not in META_COLS and c not in SURVIVAL_COLS]
+
+
+class ClinicalEncoder:
+    """将 CSV 临床列编码为固定长度 float 向量（数值标准化 + 类别 one-hot）。"""
+
+    def __init__(self):
+        self.numeric_cols = []
+        self.categorical_cols = []
+        self.numeric_mean = {}
+        self.numeric_std = {}
+        self.cat_categories = {}
+        self.output_dim = 0
+        self.fitted = False
+
+    def _detect_columns(self, df, clinical_cols):
+        numeric_cols, categorical_cols = [], []
+        for col in clinical_cols:
+            series = df[col]
+            if col in KNOWN_CATEGORICAL or series.dtype == object:
+                categorical_cols.append(col)
+                continue
+            coerced = pd.to_numeric(series, errors="coerce")
+            nunique = coerced.nunique(dropna=True)
+            if nunique <= 12 and set(coerced.dropna().unique()).issubset({0, 1, 0.0, 1.0}):
+                numeric_cols.append(col)
+            elif nunique <= 12 and col not in KNOWN_CATEGORICAL:
+                # 低基数整数列仍按数值处理（如 Stage=3）
+                numeric_cols.append(col)
+            else:
+                numeric_cols.append(col)
+        self.numeric_cols = numeric_cols
+        self.categorical_cols = categorical_cols
+
+    def fit(self, df):
+        clinical_cols = get_clinical_columns(df)
+        if not clinical_cols:
+            self.fitted = True
+            self.output_dim = 0
+            return self
+        self._detect_columns(df, clinical_cols)
+        for col in self.numeric_cols:
+            vals = pd.to_numeric(df[col], errors="coerce").astype(float)
+            mean = float(vals.mean()) if vals.notna().any() else 0.0
+            std = float(vals.std()) if vals.notna().any() else 1.0
+            if not np.isfinite(std) or std < 1e-6:
+                std = 1.0
+            self.numeric_mean[col] = mean
+            self.numeric_std[col] = std
+        for col in self.categorical_cols:
+            cats = df[col].fillna("missing").astype(str).unique().tolist()
+            cats = sorted(set(cats))
+            if "missing" not in cats:
+                cats.append("missing")
+            self.cat_categories[col] = cats
+        self.output_dim = len(self.numeric_cols) + sum(
+            len(self.cat_categories[c]) for c in self.categorical_cols
+        )
+        self.fitted = True
+        return self
+
+    def transform_row(self, row):
+        if not self.fitted or self.output_dim == 0:
+            return np.zeros((0,), dtype=np.float32)
+        feats = []
+        for col in self.numeric_cols:
+            val = pd.to_numeric(row.get(col, np.nan), errors="coerce")
+            val = float(val) if pd.notna(val) else self.numeric_mean[col]
+            val = (val - self.numeric_mean[col]) / self.numeric_std[col]
+            feats.append(val)
+        for col in self.categorical_cols:
+            raw = row.get(col, "missing")
+            val = "missing" if pd.isna(raw) else str(raw)
+            cats = self.cat_categories[col]
+            onehot = [1.0 if val == c else 0.0 for c in cats]
+            feats.extend(onehot)
+        return np.asarray(feats, dtype=np.float32)
+
+    def transform_df(self, pt_df):
+        return np.stack([self.transform_row(pt_df.iloc[i]) for i in range(len(pt_df))], axis=0)
+
+    def to_dict(self):
+        return {
+            "numeric_cols": self.numeric_cols,
+            "categorical_cols": self.categorical_cols,
+            "numeric_mean": self.numeric_mean,
+            "numeric_std": self.numeric_std,
+            "cat_categories": self.cat_categories,
+            "output_dim": self.output_dim,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        enc = cls()
+        enc.numeric_cols = list(d.get("numeric_cols", []))
+        enc.categorical_cols = list(d.get("categorical_cols", []))
+        enc.numeric_mean = {k: float(v) for k, v in d.get("numeric_mean", {}).items()}
+        enc.numeric_std = {k: float(v) for k, v in d.get("numeric_std", {}).items()}
+        enc.cat_categories = {k: list(v) for k, v in d.get("cat_categories", {}).items()}
+        enc.output_dim = int(d.get("output_dim", 0))
+        enc.fitted = True
+        return enc
+
+
+def save_clinical_encoder(encoder, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(encoder.to_dict(), f, ensure_ascii=False, indent=2)
+
+
+def load_clinical_encoder(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return ClinicalEncoder.from_dict(json.load(f))
+
+
 def build_patient_table(df, target, n_bins):
-    """构建患者级表：每个 case 一行，含 event_time / censorship / disc_label / 特征路径列表。"""
+    """构建患者级表：每个 case 一行，含 event_time / censorship / disc_label / 特征路径 / 临床列。"""
     month_col, status_col = TARGET_COLS[target]
     if month_col not in df.columns or status_col not in df.columns:
         raise KeyError(f"CSV 缺少目标列 {month_col}/{status_col}（target={target}）")
@@ -307,24 +531,26 @@ def build_patient_table(df, target, n_bins):
     df[month_col] = pd.to_numeric(df[month_col], errors="coerce")
     df[status_col] = pd.to_numeric(df[status_col], errors="coerce")
     df = df.dropna(subset=[month_col, status_col, "case_id", "slide_feat_path"])
+    clinical_cols = get_clinical_columns(df)
 
-    # 按 case 聚合：时间/状态取该 case 第一条（同一患者应一致），特征路径收集为列表
     records = []
     for case_id, g in df.groupby("case_id", sort=False):
         event_time = float(g[month_col].iloc[0])
         status = int(round(float(g[status_col].iloc[0])))
-        censorship = 1 - status  # 1=删失, 0=事件
+        censorship = 1 - status
         feat_paths = list(g["slide_feat_path"].astype(str))
-        records.append(
-            {"case_id": case_id, "event_time": event_time,
-             "censorship": censorship, "feat_paths": feat_paths}
-        )
+        rec = {
+            "case_id": case_id, "event_time": event_time,
+            "censorship": censorship, "feat_paths": feat_paths,
+        }
+        for col in clinical_cols:
+            rec[col] = g[col].iloc[0]
+        records.append(rec)
     pt = pd.DataFrame(records).reset_index(drop=True)
 
-    # 离散化时间区间（基于未删失样本的分位数），沿用 MambaMIL/CLAM 做法
     disc, n_classes = discretize_time(pt, n_bins)
     pt["disc_label"] = disc
-    return pt, n_classes
+    return pt, n_classes, clinical_cols
 
 
 def discretize_time(pt, n_bins):
@@ -348,13 +574,18 @@ def discretize_time(pt, n_bins):
 
 
 class SurvivalBagDataset(torch.utils.data.Dataset):
-    """患者级数据集；每个样本返回拼接后的 bag 特征。"""
+    """患者级数据集；每个样本返回 bag 特征 + 临床向量。"""
 
-    def __init__(self, pt_df, feat_key, max_slides_train, training):
+    def __init__(self, pt_df, feat_key, max_slides_train, training, clinical_encoder=None):
         self.pt = pt_df.reset_index(drop=True)
         self.feat_key = feat_key
         self.max_slides_train = max_slides_train
         self.training = training
+        self.clinical_encoder = clinical_encoder
+        if clinical_encoder is not None and clinical_encoder.output_dim > 0:
+            self.clinical_matrix = clinical_encoder.transform_df(self.pt)
+        else:
+            self.clinical_matrix = None
 
     def __len__(self):
         return len(self.pt)
@@ -362,13 +593,17 @@ class SurvivalBagDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         row = self.pt.iloc[idx]
         paths = list(row["feat_paths"])
-        # 训练时：slide 数 > max 则随机选 max 张；推理/验证：全部拼接
         if self.training and self.max_slides_train > 0 and len(paths) > self.max_slides_train:
             paths = random.sample(paths, self.max_slides_train)
         feats = [load_features(p, self.feat_key) for p in paths]
         feats = np.concatenate(feats, axis=0)
+        if self.clinical_matrix is not None:
+            clinical = torch.from_numpy(self.clinical_matrix[idx]).float()
+        else:
+            clinical = torch.zeros((0,), dtype=torch.float32)
         return (
             torch.from_numpy(feats).float(),
+            clinical,
             int(row["disc_label"]),
             float(row["event_time"]),
             float(row["censorship"]),
@@ -377,17 +612,43 @@ class SurvivalBagDataset(torch.utils.data.Dataset):
 
 
 def collate_bag(batch):
-    # batch_size 固定为 1（bag 大小可变）
-    feats, label, et, c, cid = batch[0]
-    return feats, label, et, c, cid
+    feats, clinical, label, et, c, cid = batch[0]
+    return feats, clinical, label, et, c, cid
 
 
-def make_loader(pt_df, cfg, training):
-    ds = SurvivalBagDataset(pt_df, cfg["feat_key"], cfg["max_slides_train"], training)
+def make_loader(pt_df, cfg, training, clinical_encoder=None):
+    ds = SurvivalBagDataset(
+        pt_df, cfg["feat_key"], cfg["max_slides_train"], training, clinical_encoder
+    )
     return torch.utils.data.DataLoader(
         ds, batch_size=1, shuffle=training, num_workers=cfg["num_workers"],
         collate_fn=collate_bag,
     )
+
+
+def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
+    if not cfg.get("use_clinical", True):
+        cfg["clinical_in_dim"] = 0
+        return None
+    encoder = ClinicalEncoder().fit(pt_train)
+    cfg["clinical_in_dim"] = int(encoder.output_dim)
+    if out_dir is not None:
+        save_clinical_encoder(encoder, os.path.join(out_dir, "clinical_encoder.json"))
+    print(f"临床特征维度: {encoder.output_dim}  "
+          f"(数值列 {len(encoder.numeric_cols)}, 类别列 {len(encoder.categorical_cols)})")
+    if encoder.numeric_cols:
+        print(f"  数值列: {encoder.numeric_cols}")
+    if encoder.categorical_cols:
+        print(f"  类别列: {encoder.categorical_cols}")
+    return encoder
+
+
+def model_forward(model, feats, clinical, cfg, device):
+    use_clinical = bool(cfg.get("use_clinical", True)) and int(cfg.get("clinical_in_dim", 0) or 0) > 0
+    if use_clinical:
+        clinical = clinical.to(device, non_blocking=True)
+        return model(feats, clinical)
+    return model(feats, None)
 
 
 # ============================================================================
@@ -401,13 +662,13 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True):
     if train:
         optimizer.zero_grad()
 
-    for i, (feats, label, et, c, _cid) in enumerate(loader):
+    for i, (feats, clinical, label, et, c, _cid) in enumerate(loader):
         feats = feats.to(device, non_blocking=True)
         label_t = torch.tensor([label], device=device)
         c_t = torch.tensor([c], device=device, dtype=torch.float32)
 
         with torch.set_grad_enabled(train):
-            hazards, S, _ = model(feats)
+            hazards, S, _ = model_forward(model, feats, clinical, cfg, device)
             loss = nll_surv_loss(hazards, S, label_t, c_t, alpha=cfg["alpha_surv"])
 
         if train:
@@ -431,10 +692,14 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     os.makedirs(out_dir, exist_ok=True)
     set_seed(cfg["seed"])
 
+    encoder = prepare_clinical_encoder(pt_train, cfg, out_dir)
     model = build_model(cfg, device)
     optimizer = get_optimizer(model, cfg)
-    train_loader = make_loader(pt_train, cfg, training=True)
-    val_loader = make_loader(pt_val, cfg, training=False) if pt_val is not None else None
+    train_loader = make_loader(pt_train, cfg, training=True, clinical_encoder=encoder)
+    val_loader = (
+        make_loader(pt_val, cfg, training=False, clinical_encoder=encoder)
+        if pt_val is not None else None
+    )
 
     history = []  # 每个 epoch 的指标
     best_cindex, best_epoch = -1.0, -1
@@ -541,18 +806,30 @@ def train_all(pt, cfg, device, log_dir):
 @torch.no_grad()
 def run_inference(cfg, device, args):
     df = read_csv_smart(args.csv_path)
-    pt, _ = build_patient_table(df, cfg["target"], cfg["n_bins"])
+    pt, _, _ = build_patient_table(df, cfg["target"], cfg["n_bins"])
+
+    ckpt_dir = os.path.dirname(os.path.abspath(args.ckpt_path))
+    encoder_path = os.path.join(ckpt_dir, "clinical_encoder.json")
+    encoder = None
+    if cfg.get("use_clinical", True):
+        if os.path.isfile(encoder_path):
+            encoder = load_clinical_encoder(encoder_path)
+            cfg["clinical_in_dim"] = encoder.output_dim
+        else:
+            print(f"警告: 未找到 {encoder_path}，将不使用临床特征推理")
+            cfg["use_clinical"] = False
+            cfg["clinical_in_dim"] = 0
 
     model = build_model(cfg, device)
     state = torch.load(args.ckpt_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
 
-    loader = make_loader(pt, cfg, training=False)  # 推理拼接全部 slide
+    loader = make_loader(pt, cfg, training=False, clinical_encoder=encoder)
     rows, risks, censors, times = [], [], [], []
-    for feats, label, et, c, cid in loader:
+    for feats, clinical, label, et, c, cid in loader:
         feats = feats.to(device)
-        hazards, S, _ = model(feats)
+        hazards, S, _ = model_forward(model, feats, clinical, cfg, device)
         risk = float(-torch.sum(S, dim=1).cpu().item())
         rows.append({"case_id": cid, "risk_score": risk,
                      "event_time": et, "censorship": c, "status": int(1 - c)})
@@ -663,6 +940,14 @@ def get_args():
     p.add_argument("--feat_key", type=str, default="features",
                    help="h5 中特征数据集的键名（默认 features）")
 
+    # 临床特征中期融合
+    p.add_argument("--use_clinical", action=argparse.BooleanOptionalAction, default=True,
+                   help="是否使用 CSV 中除 slide/标签外的临床信息（默认开启）")
+    p.add_argument("--fusion_type", choices=["concat", "bilinear", "gated"], default="concat",
+                   help="MIL 全局表征与临床嵌入的中期融合方式")
+    p.add_argument("--clinical_hidden_dim", type=int, default=256,
+                   help="临床 MLP 中间层维度（实际嵌入维 = max(32, hidden_dim//2)）")
+
     # MambaMIL 专用
     p.add_argument("--mambamil_layer", type=int, default=2)
     p.add_argument("--mambamil_rate", type=int, default=10)
@@ -691,13 +976,14 @@ def main():
     # ---- 训练 ----
     set_seed(cfg["seed"])
     df = read_csv_smart(args.csv_path)
-    pt, n_classes = build_patient_table(df, cfg["target"], cfg["n_bins"])
+    pt, n_classes, clinical_cols = build_patient_table(df, cfg["target"], cfg["n_bins"])
     cfg["n_classes"] = int(n_classes)
     if cfg["in_dim"] is None or cfg["in_dim"] <= 0:
         all_paths = [p for ps in pt["feat_paths"] for p in ps]
         cfg["in_dim"] = detect_in_dim(all_paths, cfg["feat_key"])
     print(f"患者数: {len(pt)}, 事件数: {int((pt['censorship'] == 0).sum())}, "
-          f"特征维度: {cfg['in_dim']}, n_classes(时间区间): {cfg['n_classes']}")
+          f"特征维度: {cfg['in_dim']}, n_classes(时间区间): {cfg['n_classes']}, "
+          f"临床列数: {len(clinical_cols)}, fusion: {cfg.get('fusion_type', 'concat')}")
 
     log_dir = os.path.join(args.log_root, args.exp_name)
     os.makedirs(log_dir, exist_ok=True)
