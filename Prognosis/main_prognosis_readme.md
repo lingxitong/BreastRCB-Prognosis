@@ -7,7 +7,7 @@
 - **损失**：NLL 生存损失（NLLSurvLoss）。
 - **评价指标**：Harrell c-index（`event = 1 - censorship`）。优先使用 `sksurv`，其次 `lifelines`，都没有时自动回退到内置 numpy 实现，**无需额外安装依赖**。
 - **多 slide 拼 bag**：一个患者（`case_id`）可能有多张 slide。训练时把多张 slide 的特征拼接成一个 bag，若 slide 数 `> max_slides_train` 则随机抽取该数量；**推理时拼接全部 slide**。
-- **临床中期融合**（默认开启）：MIL 聚合器得到 slide 级全局表征后，与编码后的临床向量融合，再输入生存预测头。
+- **临床中期融合**（默认开启）：MIL 聚合器得到 slide 级全局表征后，与编码后的临床向量融合，再输入生存预测头。融合时**严格排除**全部生存结局列（`OS_*`/`DFS_*`/`RFS_*`）及内部派生的 `event_time`/`censorship`，避免标签泄露。
 
 ---
 
@@ -30,13 +30,23 @@
 
 ### 临床/病理列（`--use_clinical` 默认开启时使用）
 
-除 `case_id`、`slide_id`、`slide_feat_path` 以及 OS/DFS/RFS 的 month/status 列外，**其余列均作为临床特征**自动纳入模型，例如：
+除下列**禁止列**外，CSV 中其余列均作为临床特征自动纳入模型，例如：
 
 | 类型 | 示例列 |
 | --- | --- |
 | 数值 | `Age`、`ER_pct_pre`、`Stage`、`MP`、`Tils` 等 |
 | 二值 0/1 | `ER_status`、`PR_status`、`Fibrosis`、`Necrosis` 等 |
 | 类别 | `HER2_score_pre`（如 `1+`）、`Molecular_subtype`（如 `LuminalB-`）等 |
+
+**禁止作为临床特征融合的列（防止生存分析标签泄露）**：
+
+| 类别 | 列名 | 原因 |
+| --- | --- | --- |
+| 标识 / 路径 | `case_id`、`slide_id`、`slide_feat_path` | 非临床信息 |
+| 生存结局（全部 target） | `OS_month`、`OS_status`、`DFS_month`、`DFS_status`、`RFS_month`、`RFS_status` | 训练标签，无论当前 `--target` 为何均不可融合 |
+| 患者表内部派生列 | `event_time`、`censorship`、`disc_label`、`feat_paths`、`status` | 由脚本从 survival 列派生，等价于标签 |
+
+> **重要**：即使训练目标是 `OS`，`DFS_*` / `RFS_*` 列也不会进入临床融合；反之亦然。`ClinicalEncoder` 在训练集上拟合时会对上述列做硬性排除，若检测到泄露列会直接报错。
 
 **编码规则**（在训练集上拟合，验证/推理复用）：
 - **数值列**：按训练集均值/标准差标准化；缺失值用训练集均值填充。
@@ -127,7 +137,7 @@ MIL 聚合器 (abmil / mean_mil / max_mil)
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--use_clinical` | 开启 | 使用 CSV 临床列；加 `--no-use_clinical` 关闭 |
+| `--use_clinical` | 开启 | 使用 CSV 临床列做中期融合；**自动排除**全部 OS/DFS/RFS 的 month/status 及 `event_time`/`censorship` 等标签列；加 `--no-use_clinical` 关闭 |
 | `--fusion_type` | `concat` | 融合方式：`concat` / `bilinear` / `gated` |
 | `--clinical_hidden_dim` | `256` | 预留参数（当前实现中临床嵌入维由 `hidden_dim` 决定） |
 | `clinical_in_dim` | 自动 | 编码后临床向量总维度，训练时写入 `config.json`，无需手动指定 |

@@ -18,6 +18,7 @@ train_prognosis.py
   RFS_month, RFS_status, ...
 其中 *_status 约定 1=事件发生(死亡/复发/进展), 0=删失(censored)。
 slide_feat_path 指向每张 slide 的特征 .h5 文件（数据集键默认 'features'，形状 [N_patch, dim]）。
+临床融合时自动排除全部 OS/DFS/RFS 的 month/status 列及 event_time/censorship 等派生标签，防止泄露。
 
 支持三种运行模式（--mode）:
   train  : 训练。--split_mode 控制 kfold（默认）或 all_train。
@@ -120,13 +121,21 @@ HPARAM_KEYS = [
     "use_clinical", "fusion_type", "clinical_hidden_dim", "clinical_in_dim",
 ]
 
-# 不参与临床编码的列：标识符、路径、生存标签
+# 不参与临床编码的列：标识符、路径、生存标签、患者表内部派生列
 META_COLS = {"case_id", "slide_id", "slide_feat_path"}
 SURVIVAL_COLS = {
     "OS_month", "OS_status", "DFS_month", "DFS_status", "RFS_month", "RFS_status",
 }
+# build_patient_table 生成的内部列，含当前 target 的 event_time/censorship，禁止作为临床特征
+INTERNAL_COLS = {"event_time", "censorship", "disc_label", "feat_paths", "status"}
 # 已知类别型临床列（其余 object/低基数列也会自动识别为类别）
 KNOWN_CATEGORICAL = {"HER2_score_pre", "Molecular_subtype"}
+
+
+def get_clinical_columns(df):
+    """返回可用于临床融合的列，严格排除标识符、全部生存结局及内部派生标签。"""
+    excluded = META_COLS | SURVIVAL_COLS | INTERNAL_COLS
+    return [c for c in df.columns if c not in excluded]
 
 
 # ============================================================================
@@ -406,10 +415,6 @@ def load_features(path, feat_key):
     return np.asarray(feats, dtype=np.float32)
 
 
-def get_clinical_columns(df):
-    return [c for c in df.columns if c not in META_COLS and c not in SURVIVAL_COLS]
-
-
 class ClinicalEncoder:
     """将 CSV 临床列编码为固定长度 float 向量（数值标准化 + 类别 one-hot）。"""
 
@@ -443,6 +448,9 @@ class ClinicalEncoder:
 
     def fit(self, df):
         clinical_cols = get_clinical_columns(df)
+        leaked = set(clinical_cols) & (SURVIVAL_COLS | INTERNAL_COLS)
+        if leaked:
+            raise ValueError(f"临床特征列包含生存标签/内部派生列，存在数据泄露: {sorted(leaked)}")
         if not clinical_cols:
             self.fitted = True
             self.output_dim = 0
@@ -640,6 +648,8 @@ def prepare_clinical_encoder(pt_train, cfg, out_dir=None):
         print(f"  数值列: {encoder.numeric_cols}")
     if encoder.categorical_cols:
         print(f"  类别列: {encoder.categorical_cols}")
+    excluded = sorted(META_COLS | SURVIVAL_COLS | INTERNAL_COLS)
+    print(f"  已排除（非临床/标签列）: {excluded}")
     return encoder
 
 
@@ -942,7 +952,8 @@ def get_args():
 
     # 临床特征中期融合
     p.add_argument("--use_clinical", action=argparse.BooleanOptionalAction, default=True,
-                   help="是否使用 CSV 中除 slide/标签外的临床信息（默认开启）")
+                   help="是否使用 CSV 临床列做中期融合（默认开启；"
+                        "自动排除 OS/DFS/RFS 的 month/status 及 event_time/censorship 等标签列）")
     p.add_argument("--fusion_type", choices=["concat", "bilinear", "gated"], default="concat",
                    help="MIL 全局表征与临床嵌入的中期融合方式")
     p.add_argument("--clinical_hidden_dim", type=int, default=256,
