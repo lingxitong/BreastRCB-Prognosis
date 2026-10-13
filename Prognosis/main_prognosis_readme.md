@@ -1,191 +1,265 @@
-# main_prognosis.py 使用说明
+# 原发灶 + 淋巴结预后（RCB 风格）
 
-基于 MambaMIL 预后逻辑的单脚本工具，支持**训练**（K 折 / 全量）与**推理**。
+本分支从 `main` 的离散时间生存训练改来。每个患者只用四样输入：
 
-核心建模逻辑：
-- **离散时间生存建模**：将事件时间按未删失样本的分位数离散成 `n_bins` 个区间，模型输出每个区间的 hazard，`S = cumprod(1 - hazard)`，风险分 `risk = -∑S`。
-- **损失**：NLL 生存损失（NLLSurvLoss）。
-- **评价指标**：Harrell c-index（`event = 1 - censorship`）。优先使用 `sksurv`，其次 `lifelines`，都没有时自动回退到内置 numpy 实现，**无需额外安装依赖**。
-- **多 slide 拼 bag**：一个患者（`case_id`）可能有多张 slide。训练时把多张 slide 的特征拼接成一个 bag，若 slide 数 `> max_slides_train` 则随机抽取该数量；**推理时拼接全部 slide**。
+- 一张原发肿瘤切片的特征
+- 肿瘤长径
+- 一张淋巴结切片的特征
+- 转移淋巴结个数
+
+模型先给两张切片各打一个 0 到 1 的分，再套进下面这个可训练公式。没有转移时，第二项直接为 0。
 
 ---
 
-## 一、输入数据格式
+## 一、RCB 原理，以及这里怎么对应
 
-输入是一个 CSV，格式见 `Example_Dataset_Csv.csv`。关键列：
+乳腺残余肿瘤负荷（Residual Cancer Burden, RCB；Symmans 等, JCO 2007）用一个连续指数描述新辅助治疗后的残余病灶，并据此做远处复发风险分层。MD Anderson 计算器里的形式是：
 
-| 列名 | 说明 |
+```
+RCB = 1.4 * (f_inv * d_prim) ^ 0.17
+    + [4 * (1 - 0.75 ^ LN) * d_met] ^ 0.17
+```
+
+| 符号 | 含义 |
 | --- | --- |
-| `case_id` | 患者 ID（同一患者多张 slide 共用） |
-| `slide_id` | 切片 ID |
-| `slide_feat_path` | 该切片特征 `.h5` 文件的绝对路径 |
-| `OS_month` / `OS_status` | 总生存：时间（月）/ 状态（1=死亡事件，0=删失） |
-| `DFS_month` / `DFS_status` | 无病生存：时间 / 状态 |
-| `RFS_month` / `RFS_status` | 无复发生存：时间 / 状态 |
-| 其他列 | 临床/病理特征，当前脚本不使用，可保留 |
+| `d_prim` | 残余瘤床两条最大径的几何平均，描述原发灶大小 |
+| `f_inv` | 瘤床中浸润癌所占比例 |
+| `LN` | 阳性淋巴结个数。`LN = 0` 时 `1 - 0.75^LN = 0`，淋巴结项消失 |
+| `d_met` | 最大淋巴结转移灶直径 |
+| `1.4`、`0.17` | 用 Cox 模型估出来的尺度和压缩指数 |
 
-约定：`*_status` 中 **1 = 事件发生（死亡/复发/进展），0 = 删失（censored）**；脚本内部 `censorship = 1 - status`。
+官方分档（仅经典 RCB，本模型不套用这些切点）：
 
-`.h5` 文件中特征数据集默认键名为 `features`，形状为 `[N_patch, dim]`（可用 `--feat_key` 修改）。
+| 分级 | 指数 |
+| --- | --- |
+| RCB-0 | 0，乳腺和淋巴结都无残余浸润癌 |
+| RCB-I | 0 < RCB ≤ 1.36 |
+| RCB-II | 1.36 < RCB ≤ 3.28 |
+| RCB-III | RCB > 3.28 |
+
+本分支按同样的「原发灶项 + 淋巴结项」来设计，但切片上的比例/负荷不再手工估计，而由网络从 WSI 特征里学；四个权重也改为端到端训练：
+
+```
+R = a * (tumor_size_norm * tumor_slide_score) ^ b
+  + c * (ln_count_norm * lymph_slide_score) ^ d
+```
+
+| 本模型 | 对应的 RCB 角色 |
+| --- | --- |
+| `tumor_size` | 原发灶大小（这里用长径，不再用双径几何平均） |
+| `tumor_slide_score` ∈ (0, 1) | 原发灶切片评分，对应浸润比例 `f_inv` |
+| `n_metastatic_lymph_nodes` | 阳性淋巴结个数 |
+| `lymph_slide_score` ∈ (0, 1) | 淋巴结切片评分，对应转移负荷 |
+| `a, b, c, d` | 可训练权重。`a`、`c` 为正，`b`、`d` 在 (0, 1) |
+| 转移个数 = 0 | 第二项强制为 0，淋巴结网络不参与该样本 |
+
+`tumor_size_norm`、`ln_count_norm` 是用**当前训练折**的均值去除的尺度（有转移者的个数均值）。这只是数值稳定，不改变 `a * (x)^b` 能表示的函数族。尺度写在该折目录的 `input_scaler.json`，推理必须沿用同一份。
+
+约束与初值：
+
+- `a = softplus(a_raw)`，`c = softplus(c_raw)`，初值 1.4
+- `b = sigmoid(b_raw)`，`d = sigmoid(d_raw)`，初值 0.17
+- 指数限制在 (0, 1)，避免出现「肿瘤越大风险越低」或指数过大导致溢出
+
+因此本模型的 `R` 与官方 RCB 不是同一个数，不能直接套 RCB-I/II/III 的切点。`R` 越大表示风险越高，用它计算 c-index。
 
 ---
 
-## 二、超参数说明
+## 二、网络与训练
 
-### 运行 / 路径
+```
+原发肿瘤 patch 特征 [N, dim]
+        │
+   MIL（abmil / mean / max）
+        │
+ tumor_slide_score ∈ (0, 1) ──┐
+                               │
+ 肿瘤长径 / 训练集尺度 ────────┼──► 第一项 a * (·) ^ b
+                               │
+转移个数 = 0 ? ──是──► 第二项 = 0
+        │否
+淋巴结 patch 特征 [M, dim]
+        │
+   另一套 MIL（不与原发灶共享参数）
+        │
+ lymph_slide_score ∈ (0, 1) ──┴──► 第二项 c * (·) ^ d
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--mode` | `train` | 运行模式：`train` 训练 / `infer` 推理 |
-| `--csv_path` | （必填） | 输入 CSV 路径 |
-| `--log_root` | `./logs` | 训练日志根目录 |
-| `--exp_name` | `exp` | 实验名，日志写到 `log_root/exp_name/` |
-| `--config` | `None` | 超参数 json：训练时用于**覆盖超参**；推理时用于**提供模型结构超参** |
+R = 第一项 + 第二项
+logits_k = softplus(scale) * R + bias_k
+hazard = sigmoid(logits)
+```
 
-### 训练目标与数据划分
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--target` | `OS` | 训练目标，三选一：`OS` / `DFS` / `RFS`，自动选用对应 `*_month` / `*_status` 列 |
-| `--split_mode` | `kfold` | `kfold` K 折交叉验证 / `all_train` 全量训练 |
-| `--k` | `5` | K 折折数（按 `case_id` 划分，避免同一患者跨折泄漏） |
-
-### 生存 / 训练超参
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--n_bins` | `4` | 离散时间区间数（即模型输出类别数 `n_classes`） |
-| `--max_epochs` | `50` | 每个 run 的训练轮数 |
-| `--lr` | `1e-4` | 学习率 |
-| `--reg` | `1e-5` | 权重衰减（weight decay） |
-| `--drop_out` | `0.25` | dropout 比例 |
-| `--gc` | `16` | 梯度累积步数（batch 固定为 1，bag 大小可变） |
-| `--alpha_surv` | `0.0` | NLL 生存损失中未删失样本的加权系数 |
-| `--seed` | `1` | 随机种子 |
-| `--opt` | `adam` | 优化器：`adam` / `sgd` |
-| `--num_workers` | `2` | DataLoader 进程数 |
-
-### 模型
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--model_type` | `abmil` | `abmil` / `mean_mil` / `max_mil`（内置，开箱即用）；`mamba_mil` / `trans_mil` / `s4model`（从同级 `MambaMIL` 仓库动态加载，需相应依赖，如编译好的 `mamba_ssm`） |
-| `--in_dim` | `-1` | 特征维度，`<=0` 时从首个可用 `.h5` 自动推断 |
-| `--hidden_dim` | `512` | 隐藏层维度 |
-| `--max_slides_train` | `3` | 训练时单患者最多拼接的 slide 数，超过则随机采样 |
-| `--feat_key` | `features` | `.h5` 中特征数据集的键名 |
-
-### MambaMIL 专用（仅 `--model_type mamba_mil` 时生效）
-
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--mambamil_layer` | `2` | Mamba 层数 |
-| `--mambamil_rate` | `10` | SRMamba 的 rate |
-| `--mambamil_type` | `SRMamba` | `Mamba` / `BiMamba` / `SRMamba` |
-
-> **超参数 json 覆盖规则**：训练时解析出的超参会保存为 `log_root/exp_name/config.json`。若通过 `--config xxx.json` 指定，则其中的超参字段会**覆盖**命令行默认值（仅覆盖超参类字段；`csv_path` / `log_root` / `exp_name` / `mode` 等路径与模式参数仍以命令行为准）。
+- 读出头的 `scale` 经过 softplus，恒为正。所以 `R` 升高时，每个时间箱的 hazard 都升高，生存排序与 `R` 的排序一致。
+- 损失仍是 main 分支的离散时间 NLL。时间按未删失样本分位数切成 `n_bins` 段。
+- 评价指标是 Harrell c-index，风险分用 `R` 本身，不用别的融合向量。优先 `sksurv`，其次 `lifelines`，都没有则用脚本内的 numpy 实现。
+- `a/b/c/d` 和读出头不做 weight decay，避免把公式系数往 0 上拉。MIL 编码器仍使用 `--reg`。
+- 原发灶和淋巴结是两套编码器。两张切片的特征维必须相同。
 
 ---
 
-## 三、使用方式
+## 三、CSV 列
 
-> 下文用 `PY=/home/chenwm/anaconda3/envs/pfm_seg/bin/python` 指代 Python 解释器。
+脚本读 CSV，不直接读 xlsx。把 `dataset.xlsx` 导出成 CSV 后，列名与 `Example_Dataset_Csv.csv`、`Feature_dict.json` 一致即可。一个患者一行。
 
-### 1. K 折交叉验证训练
+| 列名 | 必填 | 说明 |
+| --- | --- | --- |
+| `case_id` | 是 | 患者 ID |
+| `tumor_slide_id` | 否 | 原发肿瘤切片 ID，脚本不读，便于核对 |
+| `tumor_slide_feat_path` | 是 | 原发肿瘤 `.h5` 绝对路径 |
+| `tumor_size` | 是 | 肿瘤长径，必须 > 0 |
+| `lymph_node_slide_id` | 否 | 淋巴结切片 ID |
+| `lymph_node_slide_feat_path` | 有转移时必填 | 淋巴结 `.h5`。个数为 0 时留空 |
+| `n_metastatic_lymph_nodes` | 是 | 转移淋巴结个数，≥ 0。为 0 时第二项为 0 |
+| `OS_month` / `OS_status` | 训练 OS 时必填 | 时间（月）；1 = 死亡，0 = 删失 |
+| `DFS_month` / `DFS_status` | 训练 DFS 时必填 | 同上 |
+| `RFS_month` / `RFS_status` | 训练 RFS 时必填 | 同上 |
+
+同一 `case_id` 若有多行，只用第一行，并打印警告。
+
+`.h5` 默认键名 `features`，形状 `[N_patch, dim]`，可用 `--feat_key` 修改。
+
+列名不一致时用参数改，不必改表头：
 
 ```bash
-$PY main_prognosis.py --mode train --split_mode kfold --target OS \
-    --csv_path Example_Dataset_Csv.csv \
-    --log_root ./logs --exp_name os_kfold \
-    --k 5 --max_epochs 50
+--tumor_feat_col tumor_slide_feat_path \
+--ln_feat_col lymph_node_slide_feat_path \
+--tumor_size_col tumor_size \
+--ln_count_col n_metastatic_lymph_nodes
 ```
 
-### 2. 全量训练（all_train）
+若表里沿用旧字段，可写成 `--tumor_size_col Length --ln_count_col Number_of_lymph_node_metastases`，但原发灶/淋巴结特征路径仍要各自单独一列，不能再把多张切片堆在 `slide_feat_path` 里。
+
+---
+
+## 四、命令
+
+下文用 `python` 指当前环境的解释器。在 `Prognosis/` 目录下执行。
+
+### K 折
 
 ```bash
-$PY main_prognosis.py --mode train --split_mode all_train --target DFS \
-    --csv_path Example_Dataset_Csv.csv \
-    --log_root ./logs --exp_name dfs_all --max_epochs 50
+python main_prognosis.py --mode train --split_mode kfold --target OS \
+    --csv_path /path/to/dataset.csv \
+    --log_root ./logs --exp_name os_lymph_rcb \
+    --model_type abmil --k 5 --max_epochs 50
 ```
 
-### 3. 用 json 覆盖超参数
+### 全量训练
 
 ```bash
-$PY main_prognosis.py --mode train --target RFS \
-    --csv_path Example_Dataset_Csv.csv \
-    --log_root ./logs --exp_name rfs_kfold \
+python main_prognosis.py --mode train --split_mode all_train --target DFS \
+    --csv_path /path/to/dataset.csv \
+    --log_root ./logs --exp_name dfs_lymph_all
+```
+
+### 用 json 覆盖超参
+
+```bash
+python main_prognosis.py --mode train --target RFS \
+    --csv_path /path/to/dataset.csv \
+    --log_root ./logs --exp_name rfs_lymph \
     --config my_hparams.json
 ```
-
-`my_hparams.json` 示例：
 
 ```json
 {
     "lr": 5e-5,
     "max_epochs": 80,
-    "drop_out": 0.3,
     "n_bins": 4,
     "model_type": "abmil",
-    "max_slides_train": 3
+    "hidden_dim": 512,
+    "drop_out": 0.25
 }
 ```
 
-### 4. 推理
+### 推理
 
-推理需要训练时保存的 `config.json`（提供模型结构超参）、权重路径、与训练同格式的 CSV，以及结果保存目录：
+推理需要三样东西放在一起：`config.json`、该折目录里的 `input_scaler.json`、同一目录的权重。
 
 ```bash
-$PY main_prognosis.py --mode infer \
-    --config ./logs/os_kfold/config.json \
-    --ckpt_path ./logs/os_kfold/fold_0/checkpoint_best.pt \
-    --csv_path test.csv \
+python main_prognosis.py --mode infer \
+    --config ./logs/os_lymph_rcb/config.json \
+    --ckpt_path ./logs/os_lymph_rcb/fold_0/checkpoint_best.pt \
+    --csv_path /path/to/test.csv \
     --save_infer_dir ./infer_os
 ```
 
+脚本会到权重所在目录读取 `input_scaler.json`。换一份训练集的尺度会使 `R` 不可比。
+
 ---
 
-## 四、输出结果
+## 五、超参数
 
-### 训练（kfold）
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--mode` | `train` | `train` 或 `infer` |
+| `--csv_path` | 必填 | 输入 CSV |
+| `--log_root` / `--exp_name` | `./logs` / `exp` | 日志写到 `log_root/exp_name/` |
+| `--config` | 空 | 训练时覆盖超参；推理时提供结构超参 |
+| `--target` | `OS` | `OS` / `DFS` / `RFS` |
+| `--split_mode` | `kfold` | `kfold` 或 `all_train` |
+| `--k` | `5` | 按患者划分 |
+| `--n_bins` | `4` | 离散时间箱数 |
+| `--max_epochs` | `50` | 轮数 |
+| `--lr` | `1e-4` | 学习率 |
+| `--reg` | `1e-5` | 只作用在 MIL 权重上 |
+| `--drop_out` | `0.25` | MIL dropout |
+| `--gc` | `16` | 梯度累积步数。batch 固定为 1 |
+| `--alpha_surv` | `0.0` | NLL 中未删失项的额外权重 |
+| `--seed` | `1` | 随机种子 |
+| `--opt` | `adam` | `adam` 或 `sgd` |
+| `--num_workers` | `2` | DataLoader 进程数 |
+| `--model_type` | `abmil` | `abmil` / `mean_mil` / `max_mil` |
+| `--in_dim` | `-1` | ≤0 时从 h5 推断 |
+| `--hidden_dim` | `512` | MIL 隐层维度 |
+| `--feat_key` | `features` | h5 数据集键名 |
 
-```
-log_root/exp_name/
-├── config.json                # 本次训练的全部超参数
-├── kfold_summary.json         # k 个 best_epoch、各折/均值 val c-index
-├── fold_0/
-│   ├── metrics.csv            # 逐 epoch: train_loss / train_cindex / val_loss / val_cindex
-│   ├── history.json           # 同上（json 格式）
-│   ├── checkpoint_best.pt     # 该折 val c-index 最优权重
-│   └── checkpoint_last.pt     # 该折最后一轮权重
-├── fold_1/ ...
-└── fold_{k-1}/ ...
-```
+`a/b/c/d` 没有单独的命令行初值开关，固定从 1.4 和 0.17 起步，并写进每一折的 `metrics.csv`。
 
-`kfold_summary.json` 关键字段：`best_epochs`（k 个最佳 epoch）、`val_cindex_per_fold`、`mean_val_cindex`、`std_val_cindex`。
+---
 
-### 训练（all_train）
+## 六、输出
+
+### K 折
 
 ```
 log_root/exp_name/
 ├── config.json
-├── all_train_summary.json     # 最低 train loss 的 epoch 及 loss
-├── metrics.csv / history.json # 逐 epoch loss / c-index
-├── checkpoint_best_loss.pt    # train loss 最低的权重
-└── checkpoint_last.pt         # 最后一轮权重
+├── kfold_summary.json          # 各折 best c-index，以及该折最优时的 a,b,c,d
+└── fold_0/
+    ├── input_scaler.json       # 该折训练集的长径 / 淋巴结个数尺度
+    ├── formula.json            # 验证 c-index 最优时的 a,b,c,d,hazard_scale
+    ├── metrics.csv             # 每轮 loss、c-index、a,b,c,d
+    ├── history.json
+    ├── checkpoint_best.pt      # 验证 c-index 最优
+    └── checkpoint_last.pt
 ```
+
+### 全量训练
+
+`checkpoint_best_loss.pt` 按训练 loss 最低保存，`formula.json` 对应该时刻的系数。
 
 ### 推理
 
 ```
 save_infer_dir/
-├── metrics.json               # n_cases / n_events / c_index / target 等
-└── risk_scores.csv            # 每个患者: case_id, risk_score, event_time, censorship, status
+├── metrics.json                # c-index、公式系数、尺度
+└── risk_scores.csv
 ```
+
+`risk_scores.csv` 中：
+
+| 列 | 含义 |
+| --- | --- |
+| `risk_score` / `rcb_index` | 公式得到的 `R`，越大风险越高 |
+| `tumor_term` / `lymph_term` | 第一项、第二项。无转移时 `lymph_term = 0` |
+| `tumor_slide_score` / `lymph_slide_score` | 两张切片的评分。无转移时淋巴结评分为 0 |
+| `surv_risk` | `-sum(S)`，与 `R` 单调对应，仅作对照 |
 
 ---
 
-## 五、依赖说明
+## 七、依赖
 
-- 必需：`torch`、`h5py`、`pandas`、`numpy`、`scikit-learn`。
-- 可选：`sksurv` 或 `lifelines`（用于 c-index）；若均未安装，脚本自动使用内置 numpy 实现，结果一致。
-- `mamba_mil` / `trans_mil` / `s4model` 需要同级 `MambaMIL` 仓库及其依赖（如编译好的 `mamba_ssm`）；默认 `abmil` 无需这些依赖即可运行。
+必需：`torch`、`h5py`、`pandas`、`numpy`、`scikit-learn`。
+
+c-index 可选 `scikit-survival` 或 `lifelines`。都没装也能跑。
