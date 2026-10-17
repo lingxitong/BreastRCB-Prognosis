@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# Modified: stable log-domain RCB/NLL, survival-head initialization and training diagnostics.
 """
 淋巴结融合预后（RCB 风格公式）
 ================================
@@ -32,6 +33,7 @@ import json
 import math
 import os
 import random
+import warnings
 
 import h5py
 import numpy as np
@@ -97,6 +99,7 @@ HPARAM_KEYS = [
     "drop_out", "gc", "alpha_surv", "seed", "opt", "model_type", "in_dim",
     "hidden_dim", "feat_key", "num_workers",
     "tumor_feat_col", "ln_feat_col", "tumor_size_col", "ln_count_col",
+    "score_norm", "grad_clip", "numerics_version",
 ]
 
 TARGET_COLS = {
@@ -108,7 +111,7 @@ TARGET_COLS = {
 # 经典 RCB（Symmans 2007）一次项系数与指数，用作 a/b/c/d 的初值
 RCB_INIT_SCALE = 1.4
 RCB_INIT_EXP = 0.17
-_BASE_EPS = 1e-4
+NUMERICS_VERSION = 2
 _EMPTY_TOKENS = {"", "nan", "none", "null", "na"}
 
 
@@ -122,11 +125,22 @@ def _inv_sigmoid(y):
     return math.log(y / (1.0 - y))
 
 
-def nll_surv_loss(hazards, S, Y, c, alpha=0.0, eps=1e-7):
-    """离散时间 NLL 生存损失，与 main 分支一致。"""
+def nll_surv_loss(hazards, S, Y, c, alpha=0.0, eps=1e-7, logits=None):
+    """离散时间 NLL；训练使用 logits 路径，避免概率下溢和 clamp 断梯度。"""
     batch_size = len(Y)
     Y = Y.view(batch_size, 1).long()
     c = c.view(batch_size, 1).float()
+    if logits is not None:
+        log_h = F.logsigmoid(logits)
+        log_survival = torch.cumsum(F.logsigmoid(-logits), dim=1)
+        log_survival_padded = F.pad(log_survival, (1, 0), value=0.0)
+        uncensored_loss = -(1 - c) * (
+            torch.gather(log_survival_padded, 1, Y)
+            + torch.gather(log_h, 1, Y)
+        )
+        censored_loss = -c * torch.gather(log_survival_padded, 1, Y + 1)
+        return (uncensored_loss + (1 - alpha) * censored_loss).mean()
+    # 保留概率输入接口；正式训练不经过这一兼容路径。
     if S is None:
         S = torch.cumprod(1 - hazards, dim=1)
     S_padded = torch.cat([torch.ones_like(c), S], 1)
@@ -193,16 +207,24 @@ class MeanMaxEncoder(nn.Module):
 class SlideScorer(nn.Module):
     """MIL 表征 -> (0, 1) 切片评分，对应 RCB 中的比例/负荷项。"""
 
-    def __init__(self, encoder):
+    def __init__(self, encoder, score_norm="layernorm"):
         super().__init__()
         self.encoder = encoder
+        if score_norm not in ("layernorm", "none"):
+            raise ValueError(f"未知 score_norm: {score_norm}")
+        self.score_norm = score_norm
         self.score_head = nn.Linear(encoder.hidden_dim, 1)
-        nn.init.xavier_normal_(self.score_head.weight)
+        nn.init.normal_(self.score_head.weight, std=0.01)
         self.score_head.bias.data.zero_()
 
-    def forward(self, x):
+    def forward_logits(self, x):
         pooled = self.encoder(x)
-        return torch.sigmoid(self.score_head(pooled))
+        if self.score_norm == "layernorm":
+            pooled = F.layer_norm(pooled, (self.encoder.hidden_dim,))
+        return self.score_head(pooled)
+
+    def forward(self, x):
+        return torch.sigmoid(self.forward_logits(x))
 
 
 def build_encoder(cfg):
@@ -247,17 +269,20 @@ class RCBIndex(nn.Module):
             "d": float(d.detach().cpu()),
         }
 
-    def forward(self, tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met):
+    def forward(self, tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met,
+                tumor_log_score=None, lymph_log_score=None):
         a, b, c, d = self.coeff_values()
-        tumor_score = tumor_score.view(1, 1)
-        size = tumor_size_norm.view(1, 1).clamp(min=_BASE_EPS)
-        base_t = (size * tumor_score).clamp(min=_BASE_EPS)
-        tumor_term = a * torch.exp((b * torch.log(base_t)).clamp(-20, 20))
+        # 不对 size * score 硬截断；logsigmoid 在 sigmoid 已下溢时仍保留梯度。
+        log_score_t = (torch.log(tumor_score) if tumor_log_score is None
+                       else tumor_log_score).view(1, 1)
+        log_base_t = torch.log(tumor_size_norm.view(1, 1)) + log_score_t
+        tumor_term = a * torch.exp(b * log_base_t)
 
         if float(has_met.detach().view(-1)[0]) > 0:
-            count = ln_count_norm.view(1, 1).clamp(min=_BASE_EPS)
-            base_n = (count * lymph_score.view(1, 1)).clamp(min=_BASE_EPS)
-            lymph_term = c * torch.exp((d * torch.log(base_n)).clamp(-20, 20))
+            log_score_n = (torch.log(lymph_score) if lymph_log_score is None
+                           else lymph_log_score).view(1, 1)
+            log_base_n = torch.log(ln_count_norm.view(1, 1)) + log_score_n
+            lymph_term = c * torch.exp(d * log_base_n)
         else:
             lymph_term = tumor_term.new_zeros((1, 1))
 
@@ -268,14 +293,14 @@ class RCBIndex(nn.Module):
 class RCBPrognosisModel(nn.Module):
     """双路切片评分 + RCB 公式 + 单调离散时间读出。"""
 
-    def __init__(self, tumor_encoder, node_encoder, n_classes):
+    def __init__(self, tumor_encoder, node_encoder, n_classes, score_norm="layernorm"):
         super().__init__()
-        self.tumor_scorer = SlideScorer(tumor_encoder)
-        self.node_scorer = SlideScorer(node_encoder)
+        self.tumor_scorer = SlideScorer(tumor_encoder, score_norm)
+        self.node_scorer = SlideScorer(node_encoder, score_norm)
         self.rcb = RCBIndex()
         # softplus 后为正，保证 R 越大、每个时间箱的 hazard 越高
-        self.hazard_scale_raw = nn.Parameter(torch.tensor(0.0))
-        self.bin_bias = nn.Parameter(torch.zeros(n_classes))
+        self.hazard_scale_raw = nn.Parameter(torch.tensor(_inv_softplus(0.1)))
+        self.bin_bias = nn.Parameter(torch.full((n_classes,), _inv_sigmoid(0.1)))
 
     def formula_coeffs(self):
         coeffs = self.rcb.coeff_dict()
@@ -283,14 +308,21 @@ class RCBPrognosisModel(nn.Module):
         return coeffs
 
     def forward(self, tumor_feats, node_feats, tumor_size_norm, ln_count_norm, has_met):
-        tumor_score = self.tumor_scorer(tumor_feats)
+        tumor_logit = self.tumor_scorer.forward_logits(tumor_feats)
+        tumor_score = torch.sigmoid(tumor_logit)
+        tumor_log_score = F.logsigmoid(tumor_logit)
         if float(has_met.detach().view(-1)[0]) > 0:
-            lymph_score = self.node_scorer(node_feats)
+            lymph_logit = self.node_scorer.forward_logits(node_feats)
+            lymph_score = torch.sigmoid(lymph_logit)
+            lymph_log_score = F.logsigmoid(lymph_logit)
         else:
             lymph_score = tumor_score.new_zeros((1, 1))
+            lymph_logit = tumor_logit.new_full((1, 1), float("nan"))
+            lymph_log_score = tumor_logit.new_full((1, 1), float("nan"))
 
         rcb, tumor_term, lymph_term = self.rcb(
-            tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met
+            tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met,
+            tumor_log_score=tumor_log_score, lymph_log_score=lymph_log_score,
         )
         scale = F.softplus(self.hazard_scale_raw)
         logits = rcb * scale + self.bin_bias.view(1, -1)
@@ -302,6 +334,11 @@ class RCBPrognosisModel(nn.Module):
             "lymph_term": lymph_term,
             "tumor_score": tumor_score,
             "lymph_score": lymph_score,
+            "tumor_logit": tumor_logit,
+            "lymph_logit": lymph_logit,
+            "tumor_log_score": tumor_log_score,
+            "lymph_log_score": lymph_log_score,
+            "logits": logits,
         }
         return hazards, S, parts
 
@@ -309,7 +346,8 @@ class RCBPrognosisModel(nn.Module):
 def build_model(cfg, device):
     tumor_encoder = build_encoder(cfg)
     node_encoder = build_encoder(cfg)
-    model = RCBPrognosisModel(tumor_encoder, node_encoder, cfg["n_classes"])
+    model = RCBPrognosisModel(tumor_encoder, node_encoder, cfg["n_classes"],
+                              score_norm=cfg.get("score_norm", "layernorm"))
     return model.to(device)
 
 
@@ -336,6 +374,8 @@ def load_features(path, feat_key):
     feats = np.asarray(feats, dtype=np.float32)
     if feats.ndim != 2:
         raise ValueError(f"特征形状应为 [N_patch, dim]，实际 {feats.shape}: {path}")
+    if not feats.shape[0] or not feats.shape[1] or not np.isfinite(feats).all():
+        raise ValueError(f"特征为空或含 NaN/Inf: {path}")
     return feats
 
 
@@ -404,10 +444,13 @@ def build_patient_table(df, target, n_bins, cfg):
         if pd.isna(event_time) or pd.isna(status) or not tumor_path:
             problems.append(f"{case_id}: 生存标签或原发灶路径缺失")
             continue
-        if pd.isna(tumor_size) or float(tumor_size) <= 0:
+        if not np.isfinite(event_time) or float(event_time) < 0 or status not in (0, 1):
+            problems.append(f"{case_id}: 时间须为有限非负数，status 须为 0/1")
+            continue
+        if not np.isfinite(tumor_size) or float(tumor_size) <= 0:
             problems.append(f"{case_id}: tumor_size 必须为正数，实际 {tumor_size}")
             continue
-        if pd.isna(n_met) or float(n_met) < 0:
+        if not np.isfinite(n_met) or float(n_met) < 0:
             problems.append(f"{case_id}: 转移淋巴结个数无效 {n_met}")
             continue
         n_met = float(n_met)
@@ -540,10 +583,87 @@ def _scalar(value, device):
     return torch.tensor([float(value)], dtype=torch.float32, device=device)
 
 
-def run_epoch(model, loader, optimizer, cfg, device, train=True):
+@torch.no_grad()
+def initialize_survival_head(model, pt_train, scaler):
+    """仅用训练折事件/在险人数初始化 baseline，避免初始 hazard 普遍大于 0.5。"""
+    labels = pt_train["disc_label"].to_numpy()
+    events = pt_train["censorship"].to_numpy() == 0
+    priors = []
+    for k in range(model.bin_bias.numel()):
+        n_at_risk = int(np.sum(labels >= k))
+        n_events = int(np.sum(events & (labels == k)))
+        priors.append((n_events + 0.5) / (n_at_risk + 1) if n_at_risk else 0.1)
+    coeffs = model.rcb.coeff_dict()
+    a, b, c, d = (coeffs[key] for key in ("a", "b", "c", "d"))
+    size = pt_train["tumor_size"].to_numpy() / scaler.tumor_size_scale
+    count = pt_train["n_met"].to_numpy() / scaler.ln_count_scale
+    reference_risk = float(np.mean(a * (0.5 * size) ** b
+                                   + c * (0.5 * count) ** d))
+    h = model.bin_bias.new_tensor(priors)
+    scale = F.softplus(model.hazard_scale_raw)
+    model.bin_bias.copy_(torch.logit(h) - scale * reference_risk)
+    return {"hazard_priors": priors, "reference_risk": reference_risk,
+            "bin_bias": model.bin_bias.cpu().tolist()}
+
+
+def _gradient_norm(module):
+    grads = [p.grad.detach() for p in module.parameters() if p.grad is not None]
+    if not grads:
+        return None
+    return float(torch.linalg.vector_norm(torch.stack(
+        [torch.linalg.vector_norm(g) for g in grads]
+    )).cpu())
+
+
+def prediction_diagnostics(rows):
+    """淋巴结统计仅包含有转移者，避免正常的缺失分支 0 掩盖评分分布。"""
+    stats = {}
+    for key in ("rcb", "tumor_score", "lymph_score", "tumor_logit", "lymph_logit"):
+        selected = rows if not key.startswith("lymph") else [r for r in rows if r["has_met"]]
+        values = np.asarray([r[key] for r in selected], dtype=float)
+        stats[f"{key}_n"] = len(values)
+        if not len(values):
+            continue
+        for name, value in (("mean", values.mean()), ("std", values.std()),
+                            ("min", values.min()), ("max", values.max())):
+            stats[f"{key}_{name}"] = float(value)
+        if key == "rcb":
+            stats["rcb_n_unique"] = int(len(np.unique(values)))
+        if key.endswith("score"):
+            stats[f"{key}_zero_fraction"] = float(np.mean(values == 0))
+            stats[f"{key}_near_zero_fraction"] = float(np.mean(values < 1e-4))
+    return stats
+
+
+def print_diagnostics(stats, prefix):
+    for key in ("rcb", "tumor_score", "lymph_score"):
+        n = stats.get(f"{key}_n", 0)
+        if not n:
+            continue
+        msg = (f"[{prefix} diag] {key}: n={n} mean={stats[key + '_mean']:.3e} "
+               f"std={stats[key + '_std']:.3e} min={stats[key + '_min']:.3e} "
+               f"max={stats[key + '_max']:.3e}")
+        if key == "rcb":
+            msg += f" unique={stats['rcb_n_unique']}"
+        else:
+            msg += f" zero={stats[key + '_zero_fraction']:.1%} <1e-4={stats[key + '_near_zero_fraction']:.1%}"
+        print(msg)
+    if stats.get("rcb_n", 0) > 1 and stats.get("rcb_std", 0) < 1e-8:
+        warnings.warn(f"{prefix}: R 几乎没有个体差异，请检查评分分布和梯度。", RuntimeWarning)
+    for key in ("tumor_score", "lymph_score"):
+        if stats.get(f"{key}_n", 0) and (
+            stats[f"{key}_max"] < 1e-4 or stats[f"{key}_min"] > 1 - 1e-4
+        ):
+            warnings.warn(f"{prefix}: {key} 已接近 sigmoid 饱和区，请检查 logits 并降低学习率。",
+                          RuntimeWarning)
+
+
+def run_epoch(model, loader, optimizer, cfg, device, train=True, return_details=False):
     model.train() if train else model.eval()
     total_loss = 0.0
     risks, censors, times = [], [], []
+    rows = []
+    grad_norms = {"tumor": [], "node": []}
     gc = max(1, int(cfg["gc"]))
     if train:
         optimizer.zero_grad()
@@ -561,11 +681,23 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True):
 
         with torch.set_grad_enabled(train):
             hazards, S, parts = model(tumor_feats, node_feats, size_t, count_t, met_t)
-            loss = nll_surv_loss(hazards, S, label_t, c_t, alpha=cfg["alpha_surv"])
+            loss = nll_surv_loss(hazards, S, label_t, c_t, alpha=cfg["alpha_surv"],
+                                 logits=parts["logits"])
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"患者 {_cid} 的生存损失不是有限数，请检查输入特征和学习率。")
 
         if train:
-            (loss / gc).backward()
+            window_size = min(gc, len(loader) - (i // gc) * gc)
+            (loss / window_size).backward()
             if (i + 1) % gc == 0 or (i + 1) == len(loader):
+                if return_details:
+                    for name, module in (("tumor", model.tumor_scorer), ("node", model.node_scorer)):
+                        norm = _gradient_norm(module)
+                        if norm is not None:
+                            grad_norms[name].append(norm)
+                clip = cfg.get("grad_clip", 5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip if clip > 0 else float("inf"),
+                                               error_if_nonfinite=True)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -573,9 +705,26 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True):
         risks.append(float(parts["rcb"].detach().cpu().view(-1)[0]))
         censors.append(c)
         times.append(et)
+        if return_details:
+            row = {"case_id": _cid, "has_met": has_met, "event_time": et, "censorship": c}
+            for key in ("rcb", "tumor_term", "lymph_term", "tumor_score", "lymph_score",
+                        "tumor_logit", "lymph_logit", "tumor_log_score", "lymph_log_score"):
+                row[key] = float(parts[key].detach().cpu().reshape(-1)[0])
+            rows.append(row)
 
     avg_loss = total_loss / max(1, len(loader))
     c_index = concordance(censors, times, risks)
+    if return_details:
+        stats = prediction_diagnostics(rows)
+        if train:
+            for name, norms in grad_norms.items():
+                stats[f"{name}_grad_updates"] = len(norms)
+                if norms:
+                    stats[f"{name}_grad_norm_mean"] = float(np.mean(norms))
+                    stats[f"{name}_grad_zero_fraction"] = float(np.mean(np.asarray(norms) == 0))
+                    if all(v == 0 for v in norms):
+                        warnings.warn(f"{name} 分支本轮所有更新的梯度均为 0。", RuntimeWarning)
+        return avg_loss, c_index, {"diagnostics": stats, "predictions": rows}
     return avg_loss, c_index
 
 
@@ -590,6 +739,11 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
           f"有转移 {int(pt_train['has_met'].sum())}/{len(pt_train)}")
 
     model = build_model(cfg, device)
+    head_init = initialize_survival_head(model, pt_train, scaler)
+    with open(os.path.join(out_dir, "survival_head_init.json"), "w", encoding="utf-8") as f:
+        json.dump(head_init, f, ensure_ascii=False, indent=2)
+    print(f"[{fold_tag}] initial hazard priors: "
+          + ", ".join(f"{p:.4f}" for p in head_init["hazard_priors"]))
     optimizer = get_optimizer(model, cfg)
     train_loader = make_loader(pt_train, cfg, training=True, scaler=scaler)
     val_loader = (
@@ -600,13 +754,15 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     history = []
     best_cindex, best_epoch = -1.0, -1
     best_loss = float("inf")
+    best_val_loss = float("inf")
     best_coeffs = None
     ckpt_best = os.path.join(out_dir, "checkpoint_best.pt")
     ckpt_best_loss = os.path.join(out_dir, "checkpoint_best_loss.pt")
     ckpt_last = os.path.join(out_dir, "checkpoint_last.pt")
 
     for epoch in range(cfg["max_epochs"]):
-        tr_loss, tr_cidx = run_epoch(model, train_loader, optimizer, cfg, device, train=True)
+        tr_loss, tr_cidx, tr_details = run_epoch(
+            model, train_loader, optimizer, cfg, device, train=True, return_details=True)
         coeffs = model.formula_coeffs()
         rec = {
             "epoch": epoch,
@@ -614,19 +770,34 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
             "train_cindex": tr_cidx,
             "a": coeffs["a"], "b": coeffs["b"], "c": coeffs["c"], "d": coeffs["d"],
         }
+        rec.update({f"train_{k}": v for k, v in tr_details["diagnostics"].items()})
+        for name in ("tumor", "node"):
+            norm = tr_details["diagnostics"].get(f"{name}_grad_norm_mean")
+            if norm is not None:
+                print(f"[{fold_tag} epoch {epoch} grad] {name}: mean_norm={norm:.3e}")
         coeff_txt = (f"a={coeffs['a']:.3f} b={coeffs['b']:.3f} "
                      f"c={coeffs['c']:.3f} d={coeffs['d']:.3f}")
         if val_loader is not None:
-            val_loss, val_cidx = run_epoch(model, val_loader, optimizer, cfg, device, train=False)
+            val_loss, val_cidx, val_details = run_epoch(
+                model, val_loader, optimizer, cfg, device, train=False, return_details=True)
             rec["val_loss"] = val_loss
             rec["val_cindex"] = val_cidx
-            if val_cidx == val_cidx and val_cidx > best_cindex:
+            rec.update({f"val_{k}": v for k, v in val_details["diagnostics"].items()})
+            print_diagnostics(val_details["diagnostics"], f"{fold_tag} epoch {epoch} val")
+            predictions = pd.DataFrame(val_details["predictions"])
+            predictions.to_csv(os.path.join(out_dir, "validation_predictions.csv"), index=False,
+                               float_format="%.17g", na_rep="")
+            if val_cidx == val_cidx and (val_cidx > best_cindex or
+                                        (val_cidx == best_cindex and val_loss < best_val_loss)):
                 best_cindex, best_epoch = val_cidx, epoch
+                best_val_loss = val_loss
                 best_coeffs = coeffs
                 torch.save(model.state_dict(), ckpt_best)
+                predictions.to_csv(os.path.join(out_dir, "validation_predictions_best.csv"),
+                                   index=False, float_format="%.17g", na_rep="")
             print(f"[{fold_tag} epoch {epoch}] train_loss={tr_loss:.4f} "
                   f"train_cindex={tr_cidx:.4f} val_loss={val_loss:.4f} "
-                  f"val_cindex={val_cidx:.4f} {coeff_txt}")
+                  f"val_cindex={val_cidx:.6f} {coeff_txt}")
         else:
             if tr_loss < best_loss:
                 best_loss, best_epoch = tr_loss, epoch
@@ -634,7 +805,10 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
                 torch.save(model.state_dict(), ckpt_best_loss)
             print(f"[{fold_tag} epoch {epoch}] train_loss={tr_loss:.4f} "
                   f"train_cindex={tr_cidx:.4f} {coeff_txt}")
+            print_diagnostics(tr_details["diagnostics"], f"{fold_tag} epoch {epoch} train")
         history.append(rec)
+        # 每轮落盘，训练中断后仍可检查梯度、评分和指标。
+        pd.DataFrame(history).to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
 
     torch.save(model.state_dict(), ckpt_last)
     pd.DataFrame(history).to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
@@ -754,6 +928,10 @@ def run_inference(cfg, device, args):
             "lymph_term": float(parts["lymph_term"].cpu().view(-1)[0]),
             "tumor_slide_score": float(parts["tumor_score"].cpu().view(-1)[0]),
             "lymph_slide_score": float(parts["lymph_score"].cpu().view(-1)[0]),
+            "tumor_logit": float(parts["tumor_logit"].cpu().view(-1)[0]),
+            "lymph_logit": float(parts["lymph_logit"].cpu().view(-1)[0]),
+            "tumor_log_score": float(parts["tumor_log_score"].cpu().view(-1)[0]),
+            "lymph_log_score": float(parts["lymph_log_score"].cpu().view(-1)[0]),
             "tumor_size": raw_size,
             "n_metastatic_lymph_nodes": raw_count,
             "event_time": et,
@@ -768,7 +946,7 @@ def run_inference(cfg, device, args):
     os.makedirs(args.save_infer_dir, exist_ok=True)
     pred_df = pd.DataFrame(rows)
     pred_csv = os.path.join(args.save_infer_dir, "risk_scores.csv")
-    pred_df.to_csv(pred_csv, index=False)
+    pred_df.to_csv(pred_csv, index=False, float_format="%.17g", na_rep="")
 
     c_index = concordance(censors, times, risks)
     metrics = {
@@ -827,13 +1005,27 @@ def read_csv_smart(path):
 
 def build_config(args):
     cfg = {k: getattr(args, k) for k in HPARAM_KEYS if hasattr(args, k)}
+    saved_version = None
     if args.config and os.path.isfile(args.config):
         with open(args.config, "r", encoding="utf-8") as f:
             override = json.load(f)
+        saved_version = override.get("numerics_version")
         for k, v in override.items():
             if k in HPARAM_KEYS:
                 cfg[k] = v
         print(f"已从 {args.config} 覆盖超参数: {[k for k in override if k in HPARAM_KEYS]}")
+    if args.mode == "infer" and saved_version != NUMERICS_VERSION:
+        raise ValueError(
+            "该 config 来自旧版数值路径或缺少 numerics_version=2。"
+            "本修复改变了评分归一化和低分区域的公式计算，请使用新实验名重新训练，"
+            "并将新版 config、权重和 input_scaler 配套用于推理；旧实验需沿用旧代码复现。"
+        )
+    cfg["numerics_version"] = NUMERICS_VERSION
+    if args.mode == "train" and cfg["lr"] >= 1e-3:
+        warnings.warn(f"lr={cfg['lr']:g} 容易使 WSI 评分饱和；建议先用 --lr 1e-4 并检查评分/梯度。",
+                      RuntimeWarning)
+    if cfg.get("grad_clip", 5.0) < 0:
+        raise ValueError("grad_clip 必须 >= 0；0 表示禁用裁剪。")
     return cfg
 
 
@@ -861,6 +1053,9 @@ def get_args():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--opt", choices=["adam", "sgd"], default="adam")
     p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--score_norm", choices=["layernorm", "none"], default="layernorm",
+                   help="评分前对切片表征做无可训练参数的 LayerNorm；none 用于消融")
+    p.add_argument("--grad_clip", type=float, default=5.0, help="梯度范数裁剪阈值；0 表示禁用")
 
     p.add_argument("--model_type", choices=["abmil", "mean_mil", "max_mil"], default="abmil")
     p.add_argument("--in_dim", type=int, default=-1, help="特征维度，<=0 时从 h5 自动推断")

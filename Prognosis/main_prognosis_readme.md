@@ -89,8 +89,12 @@ logits_k = softplus(scale) * R + bias_k
 hazard = sigmoid(logits)
 ```
 
+评分头默认先对 MIL 表征做无可训练参数的 LayerNorm，并用小权重初始化，降低输入特征尺度导致 sigmoid 过早饱和的风险。公式使用 `log_score = logsigmoid(score_logit)` 计算 `exp(b * (log(size_norm) + log_score))`，数学上仍为同一幂函数，不再把 `size_norm * score` 强制截到 `1e-4`。
+
+训练前，读出头的各时间箱 baseline 用**当前训练折**的事件数和在险人数做平滑初始化，并扣除评分约 0.5 时的平均 R。初始正读出系数为 0.1，仍参与训练。初始化结果保存为 `survival_head_init.json`。
+
 - 读出头的 `scale` 经过 softplus，恒为正。所以 `R` 升高时，每个时间箱的 hazard 都升高，生存排序与 `R` 的排序一致。
-- 损失仍是 main 分支的离散时间 NLL。时间按未删失样本分位数切成 `n_bins` 段。
+- 损失是离散时间 NLL；从 logits 直接计算 log-hazard 和累计 log-survival，避免概率连乘下溢和硬截断。正常数值区域与原损失及梯度等价。时间按未删失样本分位数切成 `n_bins` 段。
 - 评价指标是 Harrell c-index，风险分用 `R` 本身，不用别的融合向量。优先 `sksurv`，其次 `lifelines`，都没有则用脚本内的 numpy 实现。
 - `a/b/c/d` 和读出头不做 weight decay，避免把公式系数往 0 上拉。MIL 编码器仍使用 `--reg`。
 - 原发灶和淋巴结是两套编码器。两张切片的特征维必须相同。
@@ -186,6 +190,8 @@ python main_prognosis.py --mode infer \
 
 脚本会到权重所在目录读取 `input_scaler.json`。换一份训练集的尺度会使 `R` 不可比。
 
+本修复保存的 `config.json` 包含 `numerics_version=2`。由于评分归一化、低评分区域计算及初始化已经改变，请重新训练新版权重；旧权重不能与新版 config 混用。旧版实验需使用原代码复现，新版推理会拒绝没有对应版本标记的旧 config。
+
 ---
 
 ## 五、超参数
@@ -215,6 +221,8 @@ python main_prognosis.py --mode infer \
 | `--feat_key` | `features` | h5 数据集键名 |
 
 `a/b/c/d` 没有单独的命令行初值开关，固定从 1.4 和 0.17 起步，并写进每一折的 `metrics.csv`。
+
+新增 `--score_norm layernorm`（默认）或 `none`，控制评分头前的归一化；`--grad_clip 5.0`（默认）控制梯度范数裁剪，设为 0 可关闭。不会擅自改变传入的学习率，`lr >= 1e-3` 时会提示饱和风险。建议首先使用 `--lr 1e-4`。
 
 ---
 
@@ -256,9 +264,45 @@ save_infer_dir/
 | `tumor_slide_score` / `lymph_slide_score` | 两张切片的评分。无转移时淋巴结评分为 0 |
 | `surv_risk` | `-sum(S)`，与 `R` 单调对应，仅作对照 |
 
+验证阶段还会保存 `validation_predictions.csv`（最新一轮）和 `validation_predictions_best.csv`（对应最优权重）；二者含每位患者的 `rcb`、两项贡献、两路评分、原始 logit 和 log-score。CSV 使用 17 位有效数字，无转移者淋巴结分支的 logit/log-score 留空，评分和公式贡献为 0。推理的 `risk_scores.csv` 同样增加两路 logit/log-score。
+
+`metrics.csv` 每轮落盘，新增 `val_rcb_std`、`val_rcb_n_unique`、评分最小/最大值、精确零值比例、接近零的比例，以及两路训练梯度范数和零梯度更新比例。验证 C-index 并列时，用更低的验证 loss 决定保存哪个权重。
+
 ---
 
-## 七、依赖
+## 七、评分全零与固定 C-index 排查
+
+旧实现存在两个数值问题：
+
+1. `clamp(size_norm * score, min=1e-4)` 会在底数低于阈值时，切断该样本到 WSI 评分网络的梯度。初始系数下每个被截断的项约为 `1.4 * (1e-4)^0.17 = 0.2925`；若两路均触底，R 可能几乎只剩有无淋巴结转移的差别。此时 loss 仍能靠 baseline 和公式参数下降，C-index 却不变。
+2. 生存概率连乘后再 `clamp` 取对数，也会在概率过小时截断梯度。加上原始正 R 和零 baseline，使初始每箱 hazard 普遍超过 0.5，容易进一步推动 WSI 评分变小。
+
+切片评分是 sigmoid 输出，代码没有将负评分直接归零。打印成 `0.0000` 可能只是显示精度；极端负 logit 也可能令 float32 sigmoid 真正下溢为 0。新版训练直接使用 log-score，因此不依赖已经下溢的 sigmoid 值继续计算公式。无转移者淋巴结分支为 0 是设计行为，诊断时只统计有转移者的淋巴结评分。
+
+从仓库根目录重新运行，使用新的实验名，避免覆盖旧日志：
+
+```bash
+python Prognosis/main_prognosis.py --mode train --split_mode kfold --target DFS \
+    --csv_path /mnt/d/BreastRCB-Prognosis-prognosis_with_lymphnode/Prognosis/Example_Dataset_Csv.csv \
+    --log_root ./logs --exp_name dfs_lymph_rcb_stable \
+    --model_type abmil --k 5 --max_epochs 50 --lr 1e-4
+```
+
+检查每轮 `diag` 中 R 的标准差/唯一值数、两路评分范围，以及 `grad` 中两路梯度范数。评分使用科学计数法显示，真正的零与小数能够区分。全部评分接近饱和或全部更新的分支梯度为 0 时会发出提示。若出现 NaN/Inf 损失或非有限梯度则中止；空 H5 或含 NaN/Inf 的特征会明确报错。
+
+C-index 只取决于患者排序，风险的绝对数值变化并不一定改变 C-index；连续若干轮相同不能单独证明训练失效。训练 C-index 使用 dropout 打开、参数逐步更新时的预测，验证 C-index 则来自同一组参数的 eval 预测，应结合验证集原始预测和梯度判断。本仓库正式入口为 `main_prognosis.py`，用户本地的 `main_prognosis2.py` 不在当前分支中。
+
+在仓库根目录运行合成数据回归测试：
+
+```bash
+python -m unittest discover -s Prognosis/tests -v
+```
+
+测试覆盖 sigmoid 下溢/旧阈值以下的梯度、RCB 公式等价、稳定 NLL 的数值与梯度、三种 MIL 编码器反传，以及合成 H5 的训练保存/推理流程。它们验证数值修复，不代表真实队列的 C-index 一定上升。
+
+---
+
+## 八、依赖
 
 必需：`torch`、`h5py`、`pandas`、`numpy`、`scikit-learn`。
 
