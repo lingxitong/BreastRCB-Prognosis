@@ -103,6 +103,10 @@ class TrainingPipelineTests(unittest.TestCase):
                 with self.subTest(fold=fold):
                     fold_dir = root / f"fold_{fold}"
                     pt_train = pt.iloc[train_idx]
+                    fold_cfg = read_json(fold_dir / "config.json")
+                    time_bins = read_json(fold_dir / "time_bins.json")
+                    self.assertEqual(time_bins, prognosis.fit_time_bins(pt_train, cfg["n_bins"]))
+                    pt_train = prognosis.apply_time_bins(pt_train, time_bins)
                     self.assertNotEqual(len(pt_train) % cfg["gc"], 0)
                     self.assertGreater(int(pt_train["has_met"].sum()), 0)
                     self.assertLess(int(pt_train["has_met"].sum()), len(pt_train))
@@ -111,12 +115,13 @@ class TrainingPipelineTests(unittest.TestCase):
                         "history.json", "formula.json", "input_scaler.json",
                         "survival_head_init.json", "validation_predictions.csv",
                         "validation_predictions_best.csv",
+                        "config.json", "time_bins.json",
                     ):
                         self.assertTrue((fold_dir / filename).is_file(), filename)
                         self.assertGreater((fold_dir / filename).stat().st_size, 0, filename)
                     state = torch.load(fold_dir / "checkpoint_best.pt", map_location="cpu",
                                        weights_only=True)
-                    reloaded = prognosis.build_model(cfg, device)
+                    reloaded = prognosis.build_model(fold_cfg, device)
                     reloaded.load_state_dict(state, strict=True)
                     self.assertTrue(all(torch.isfinite(value).all() for value in state.values()))
                     for branch in ("tumor_scorer", "node_scorer"):
@@ -149,7 +154,7 @@ class TrainingPipelineTests(unittest.TestCase):
                     self.assertAlmostEqual(scaler_dict["ln_count_scale"],
                                            pt_train.loc[pt_train["n_met"] > 0, "n_met"].mean())
                     expected_init = prognosis.initialize_survival_head(
-                        prognosis.build_model(cfg, device), pt_train,
+                        prognosis.build_model(fold_cfg, device), pt_train,
                         prognosis.InputScaler().fit(pt_train),
                     )
                     saved_init = read_json(fold_dir / "survival_head_init.json")
@@ -225,8 +230,8 @@ class InputContractTests(unittest.TestCase):
     def test_inference_rejects_legacy_or_missing_versioned_config(self):
         with tempfile.TemporaryDirectory(prefix="rcb_config_") as tmp:
             path = Path(tmp) / "config.json"
-            self.assertEqual(prognosis.NUMERICS_VERSION, 3)
-            for version in (None, 1, 2, prognosis.NUMERICS_VERSION + 1):
+            self.assertEqual(prognosis.NUMERICS_VERSION, 4)
+            for version in (None, 1, 2, 3, prognosis.NUMERICS_VERSION + 1):
                 with self.subTest(version=version):
                     cfg = small_config()
                     if version is None:
@@ -240,7 +245,7 @@ class InputContractTests(unittest.TestCase):
             path.write_text(json.dumps(small_config()), encoding="utf-8")
             with contextlib.redirect_stdout(io.StringIO()):
                 loaded = prognosis.build_config(Namespace(mode="infer", config=str(path)))
-            self.assertEqual(loaded["numerics_version"], 3)
+            self.assertEqual(loaded["numerics_version"], 4)
             with self.assertRaisesRegex(ValueError, "numerics_version"):
                 prognosis.build_config(Namespace(mode="infer", config=None))
 

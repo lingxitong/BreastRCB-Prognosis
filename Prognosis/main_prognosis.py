@@ -1,9 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Modified: no trainable a/b/c/d; R = size_norm*tumor_score + count_norm*lymph_score,
-#           stable log-domain NLL, survival-head init, diagnostics.
+# Modified: optional lymph-node and clinical fusion on the coefficient-free model.
 """
-淋巴结融合预后（无公式系数版）
+原发灶预后：淋巴结与临床信息可独立开关
 ================================
 保留 tumor_size 和 n_met，但去掉 a/b/c/d：
 
@@ -16,6 +15,8 @@
 
 R 再经单调读出头变成离散时间 hazard，用 NLL 生存损失训练。
 c-index 直接用 R 排序（越大风险越高）。
+临床信息在 MIL 表征和评分头之间融合；关闭临床时保留原评分路径。
+关闭淋巴结时不读取其 H5、不要求其路径和计数列，第二项恒为 0。
 """
 
 from __future__ import print_function
@@ -34,6 +35,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import KFold
+
+from clinical_utils import (
+    ClinicalEncoder, build_fusion, get_clinical_columns,
+    load_clinical_encoder, save_clinical_encoder,
+)
 
 
 def _builtin_cindex(censorships, event_times, risk_scores):
@@ -91,6 +97,8 @@ HPARAM_KEYS = [
     "hidden_dim", "feat_key", "num_workers",
     "tumor_feat_col", "ln_feat_col", "tumor_size_col", "ln_count_col",
     "score_norm", "grad_clip", "numerics_version",
+    "use_lymphnode", "use_clinical", "fusion_type", "clinical_hidden_dim",
+    "clinical_in_dim", "clinical_cols", "categorical_cols",
 ]
 
 TARGET_COLS = {
@@ -99,7 +107,7 @@ TARGET_COLS = {
     "RFS": ("RFS_month", "RFS_status"),
 }
 
-NUMERICS_VERSION = 3  # 去 a/b/c/d 版，与旧实验不兼容
+NUMERICS_VERSION = 4  # 可选融合版；推理复用对应训练折的配置、编码器与时间边界。
 _EMPTY_TOKENS = {"", "nan", "none", "null", "na"}
 
 
@@ -194,24 +202,32 @@ class MeanMaxEncoder(nn.Module):
 class SlideScorer(nn.Module):
     """MIL 表征 -> (0, 1) 切片评分。"""
 
-    def __init__(self, encoder, score_norm="layernorm"):
+    def __init__(self, encoder, score_norm="layernorm", clinical_dim=0,
+                 fusion_type="concat", dropout=0.25):
         super().__init__()
         self.encoder = encoder
         if score_norm not in ("layernorm", "none"):
             raise ValueError(f"未知 score_norm: {score_norm}")
         self.score_norm = score_norm
+        self.fusion = (build_fusion(fusion_type, encoder.hidden_dim, clinical_dim,
+                                    encoder.hidden_dim, dropout)
+                       if clinical_dim > 0 else None)
         self.score_head = nn.Linear(encoder.hidden_dim, 1)
         nn.init.normal_(self.score_head.weight, std=0.01)
         self.score_head.bias.data.zero_()
 
-    def forward_logits(self, x):
+    def forward_logits(self, x, clinical=None):
         pooled = self.encoder(x)
+        if self.fusion is not None:
+            if clinical is None:
+                raise ValueError("临床融合已启用，必须提供临床表征。")
+            pooled = self.fusion(pooled, clinical)
         if self.score_norm == "layernorm":
             pooled = F.layer_norm(pooled, (self.encoder.hidden_dim,))
         return self.score_head(pooled)
 
-    def forward(self, x):
-        return torch.sigmoid(self.forward_logits(x))
+    def forward(self, x, clinical=None):
+        return torch.sigmoid(self.forward_logits(x, clinical))
 
 
 def build_encoder(cfg):
@@ -255,10 +271,24 @@ class RCBIndex(nn.Module):
 class RCBPrognosisModel(nn.Module):
     """双路 WSI 评分 + size/count 线性组合 + 单调离散时间读出。"""
 
-    def __init__(self, tumor_encoder, node_encoder, n_classes, score_norm="layernorm"):
+    def __init__(self, tumor_encoder, node_encoder, n_classes, score_norm="layernorm",
+                 use_lymphnode=True, use_clinical=False, clinical_in_dim=0,
+                 clinical_hidden_dim=128, fusion_type="concat", dropout=0.25):
         super().__init__()
-        self.tumor_scorer = SlideScorer(tumor_encoder, score_norm)
-        self.node_scorer = SlideScorer(node_encoder, score_norm)
+        self.use_lymphnode = bool(use_lymphnode)
+        self.use_clinical = bool(use_clinical)
+        if self.use_clinical and (clinical_in_dim <= 0 or clinical_hidden_dim <= 0):
+            raise ValueError("临床融合需要正数 clinical_in_dim 和 clinical_hidden_dim。")
+        clinical_dim = clinical_hidden_dim if self.use_clinical else 0
+        self.tumor_scorer = SlideScorer(tumor_encoder, score_norm, clinical_dim,
+                                       fusion_type, dropout)
+        self.node_scorer = (SlideScorer(node_encoder, score_norm, clinical_dim,
+                                        fusion_type, dropout) if self.use_lymphnode else None)
+        self.clinical_mlp = None
+        if self.use_clinical:
+            self.clinical_mlp = nn.Sequential(nn.Linear(clinical_in_dim, clinical_hidden_dim),
+                                              nn.ReLU(), nn.Dropout(dropout))
+            self.clinical_mlp.apply(_init_weights)
         self.rcb = RCBIndex()
         self.hazard_scale_raw = nn.Parameter(torch.tensor(_inv_softplus(0.1)))
         self.bin_bias = nn.Parameter(torch.full((n_classes,), _inv_sigmoid(0.1)))
@@ -266,12 +296,20 @@ class RCBPrognosisModel(nn.Module):
     def formula_coeffs(self):
         return {"hazard_scale": float(F.softplus(self.hazard_scale_raw).detach().cpu())}
 
-    def forward(self, tumor_feats, node_feats, tumor_size_norm, ln_count_norm, has_met):
-        tumor_logit = self.tumor_scorer.forward_logits(tumor_feats)
+    def forward(self, tumor_feats, node_feats, tumor_size_norm, ln_count_norm, has_met,
+                clinical=None):
+        clinical_repr = None
+        if self.use_clinical:
+            if clinical is None:
+                raise ValueError("use_clinical=True 时必须提供 clinical 特征。")
+            clinical = clinical.unsqueeze(0) if clinical.dim() == 1 else clinical
+            clinical_repr = self.clinical_mlp(clinical)
+        tumor_logit = self.tumor_scorer.forward_logits(tumor_feats, clinical_repr)
         tumor_score = torch.sigmoid(tumor_logit)
         tumor_log_score = F.logsigmoid(tumor_logit)
-        if float(has_met.detach().view(-1)[0]) > 0:
-            lymph_logit = self.node_scorer.forward_logits(node_feats)
+        active_node = self.use_lymphnode and float(has_met.detach().view(-1)[0]) > 0
+        if active_node:
+            lymph_logit = self.node_scorer.forward_logits(node_feats, clinical_repr)
             lymph_score = torch.sigmoid(lymph_logit)
             lymph_log_score = F.logsigmoid(lymph_logit)
         else:
@@ -280,7 +318,8 @@ class RCBPrognosisModel(nn.Module):
             lymph_log_score = tumor_logit.new_full((1, 1), float("nan"))
 
         rcb, tumor_term, lymph_term = self.rcb(
-            tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met
+            tumor_score, tumor_size_norm, lymph_score, ln_count_norm,
+            has_met if active_node else torch.zeros_like(has_met),
         )
         scale = F.softplus(self.hazard_scale_raw)
         logits = rcb * scale + self.bin_bias.view(1, -1)
@@ -303,9 +342,15 @@ class RCBPrognosisModel(nn.Module):
 
 def build_model(cfg, device):
     tumor_encoder = build_encoder(cfg)
-    node_encoder = build_encoder(cfg)
+    node_encoder = build_encoder(cfg) if cfg.get("use_lymphnode", True) else None
     model = RCBPrognosisModel(tumor_encoder, node_encoder, cfg["n_classes"],
-                              score_norm=cfg.get("score_norm", "layernorm"))
+                              score_norm=cfg.get("score_norm", "layernorm"),
+                              use_lymphnode=cfg.get("use_lymphnode", True),
+                              use_clinical=cfg.get("use_clinical", False),
+                              clinical_in_dim=cfg.get("clinical_in_dim", 0),
+                              clinical_hidden_dim=cfg.get("clinical_hidden_dim", 128),
+                              fusion_type=cfg.get("fusion_type", "concat"),
+                              dropout=cfg["drop_out"])
     return model.to(device)
 
 
@@ -347,45 +392,48 @@ def _clean_path(value):
     return text
 
 
-def discretize_time(pt, n_bins):
-    eps = 1e-6
-    uncensored = pt[pt["censorship"] == 0]
-    src = uncensored if len(uncensored) >= n_bins else pt
-    try:
-        _, q_bins = pd.qcut(src["event_time"], q=n_bins, retbins=True,
-                            labels=False, duplicates="drop")
-    except Exception:
-        q_bins = np.linspace(pt["event_time"].min(), pt["event_time"].max(), n_bins + 1)
-    q_bins = np.asarray(q_bins, dtype=float)
-    q_bins[0] = pt["event_time"].min() - eps
-    q_bins[-1] = pt["event_time"].max() + eps
-    q_bins = np.unique(q_bins)
-    disc = pd.cut(pt["event_time"], bins=q_bins, labels=False,
-                  right=False, include_lowest=True)
-    disc = disc.fillna(0).astype(int).values
-    n_classes = len(q_bins) - 1
-    return disc, n_classes
+def fit_time_bins(pt_train, n_bins):
+    """只保存训练折拟合的内部切点；外部时间按相同边界映射，不重新分位数分箱。"""
+    if int(n_bins) < 1:
+        raise ValueError("n_bins 必须 >= 1。")
+    observed = pt_train.loc[pt_train["censorship"] == 0, "event_time"]
+    src = observed if len(observed) >= n_bins else pt_train["event_time"]
+    edges = np.unique(np.quantile(src.to_numpy(dtype=float), np.linspace(0, 1, n_bins + 1)))
+    cuts = edges[1:-1].tolist()
+    return {"cut_points": cuts, "n_classes": len(cuts) + 1,
+            "fit_on": "training_patients_only"}
 
 
-def build_patient_table(df, target, n_bins, cfg):
+def apply_time_bins(pt, time_bins):
+    result = pt.copy()
+    result["disc_label"] = np.searchsorted(time_bins["cut_points"],
+                                            result["event_time"].to_numpy(), side="right")
+    return result
+
+
+def build_patient_table(df, target, n_bins, cfg, clinical_columns=None):
     """每个 case 一行：原发灶路径、长径、淋巴结路径、转移个数、生存标签。"""
     month_col, status_col = TARGET_COLS[target]
     tumor_col = cfg["tumor_feat_col"]
     ln_col = cfg["ln_feat_col"]
     size_col = cfg["tumor_size_col"]
     count_col = cfg["ln_count_col"]
-    required = ["case_id", tumor_col, size_col, count_col, month_col, status_col]
+    use_node = cfg.get("use_lymphnode", True)
+    required = ["case_id", tumor_col, size_col, month_col, status_col]
+    if use_node:
+        required += [count_col, ln_col]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"CSV 缺少列: {missing}")
-    if ln_col not in df.columns:
-        raise KeyError(f"CSV 缺少淋巴结特征列: {ln_col}")
+    clinical_columns = (get_clinical_columns(df, cfg) if clinical_columns is None
+                        else clinical_columns) if cfg.get("use_clinical", False) else []
 
     df = df.copy()
     df[month_col] = pd.to_numeric(df[month_col], errors="coerce")
     df[status_col] = pd.to_numeric(df[status_col], errors="coerce")
     df[size_col] = pd.to_numeric(df[size_col], errors="coerce")
-    df[count_col] = pd.to_numeric(df[count_col], errors="coerce")
+    if use_node:
+        df[count_col] = pd.to_numeric(df[count_col], errors="coerce")
 
     records = []
     problems = []
@@ -397,9 +445,9 @@ def build_patient_table(df, target, n_bins, cfg):
         event_time = row[month_col]
         status = row[status_col]
         tumor_size = row[size_col]
-        n_met = row[count_col]
+        n_met = row[count_col] if use_node else 0.0
         tumor_path = _clean_path(row[tumor_col])
-        ln_path = _clean_path(row[ln_col]) if ln_col in g.columns else ""
+        ln_path = _clean_path(row[ln_col]) if use_node else ""
         if pd.isna(event_time) or pd.isna(status) or not tumor_path:
             problems.append(f"{case_id}: 生存标签或原发灶路径缺失")
             continue
@@ -429,6 +477,8 @@ def build_patient_table(df, target, n_bins, cfg):
             "n_met": n_met,
             "has_met": int(has_met),
         })
+        for col in clinical_columns:
+            records[-1][col] = row.get(col, np.nan)
     if n_dup:
         print(f"警告: {n_dup} 个 case_id 有多行，仅使用每个患者的第一行。")
     if problems:
@@ -439,9 +489,9 @@ def build_patient_table(df, target, n_bins, cfg):
         raise ValueError("没有可用患者。")
 
     pt = pd.DataFrame(records).reset_index(drop=True)
-    disc, n_classes = discretize_time(pt, n_bins)
-    pt["disc_label"] = disc
-    return pt, n_classes
+    # 标签占位；train_one_run 在训练折上拟合，推理只用保存的边界。
+    pt["disc_label"] = 0
+    return pt, int(n_bins)
 
 
 class InputScaler:
@@ -485,10 +535,12 @@ def load_scaler(path):
 
 
 class LymphNodeDataset(torch.utils.data.Dataset):
-    def __init__(self, pt_df, feat_key, scaler):
+    def __init__(self, pt_df, feat_key, scaler, clinical_encoder=None, use_lymphnode=True):
         self.pt = pt_df.reset_index(drop=True)
         self.feat_key = feat_key
         self.scaler = scaler
+        self.clinical_encoder = clinical_encoder
+        self.use_lymphnode = use_lymphnode
 
     def __len__(self):
         return len(self.pt)
@@ -496,7 +548,7 @@ class LymphNodeDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         row = self.pt.iloc[idx]
         tumor_feats = load_features(row["tumor_slide_feat_path"], self.feat_key)
-        has_met = int(row["has_met"])
+        has_met = int(row["has_met"]) if self.use_lymphnode else 0
         if has_met:
             node_feats = load_features(row["lymph_node_slide_feat_path"], self.feat_key)
             if node_feats.shape[-1] != tumor_feats.shape[-1]:
@@ -507,7 +559,9 @@ class LymphNodeDataset(torch.utils.data.Dataset):
         else:
             node_feats = np.zeros((0, tumor_feats.shape[-1]), dtype=np.float32)
         size_norm = float(row["tumor_size"]) / self.scaler.tumor_size_scale
-        count_norm = float(row["n_met"]) / self.scaler.ln_count_scale
+        count_norm = float(row["n_met"]) / self.scaler.ln_count_scale if has_met else 0.0
+        clinical = (self.clinical_encoder.transform_row(row) if self.clinical_encoder is not None
+                    else np.zeros((0,), dtype=np.float32))
         return (
             torch.from_numpy(tumor_feats).float(),
             torch.from_numpy(node_feats).float(),
@@ -520,6 +574,7 @@ class LymphNodeDataset(torch.utils.data.Dataset):
             str(row["case_id"]),
             float(row["tumor_size"]),
             float(row["n_met"]),
+            torch.from_numpy(clinical).float(),
         )
 
 
@@ -527,8 +582,9 @@ def collate_case(batch):
     return batch[0]
 
 
-def make_loader(pt_df, cfg, training, scaler):
-    ds = LymphNodeDataset(pt_df, cfg["feat_key"], scaler)
+def make_loader(pt_df, cfg, training, scaler, clinical_encoder=None):
+    ds = LymphNodeDataset(pt_df, cfg["feat_key"], scaler, clinical_encoder,
+                          use_lymphnode=cfg.get("use_lymphnode", True))
     return torch.utils.data.DataLoader(
         ds, batch_size=1, shuffle=training, num_workers=cfg["num_workers"],
         collate_fn=collate_case,
@@ -551,7 +607,8 @@ def initialize_survival_head(model, pt_train, scaler):
         priors.append((n_events + 0.5) / (n_at_risk + 1) if n_at_risk else 0.1)
 
     size = pt_train["tumor_size"].to_numpy() / scaler.tumor_size_scale
-    count = pt_train["n_met"].to_numpy() / scaler.ln_count_scale
+    count = (pt_train["n_met"].to_numpy() / scaler.ln_count_scale
+             if model.use_lymphnode else np.zeros(len(pt_train)))
     reference_risk = float(np.mean(0.5 * size + 0.5 * count))
 
     h = model.bin_bias.new_tensor(priors)
@@ -562,6 +619,8 @@ def initialize_survival_head(model, pt_train, scaler):
 
 
 def _gradient_norm(module):
+    if module is None:
+        return None
     grads = [p.grad.detach() for p in module.parameters() if p.grad is not None]
     if not grads:
         return None
@@ -617,14 +676,14 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True, return_details=
     total_loss = 0.0
     risks, censors, times = [], [], []
     rows = []
-    grad_norms = {"tumor": [], "node": []}
+    grad_norms = {"tumor": [], "node": [], "clinical": []}
     gc = max(1, int(cfg["gc"]))
     if train:
         optimizer.zero_grad()
 
     for i, sample in enumerate(loader):
         (tumor_feats, node_feats, size_norm, count_norm, has_met,
-         label, et, c, _cid, _raw_size, _raw_count) = sample
+         label, et, c, _cid, _raw_size, _raw_count, clinical) = sample
         tumor_feats = tumor_feats.to(device, non_blocking=True)
         node_feats = node_feats.to(device, non_blocking=True)
         size_t = _scalar(size_norm, device)
@@ -634,7 +693,8 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True, return_details=
         c_t = torch.tensor([c], device=device, dtype=torch.float32)
 
         with torch.set_grad_enabled(train):
-            hazards, S, parts = model(tumor_feats, node_feats, size_t, count_t, met_t)
+            hazards, S, parts = model(tumor_feats, node_feats, size_t, count_t, met_t,
+                                      clinical.to(device, non_blocking=True))
             loss = nll_surv_loss(hazards, S, label_t, c_t, alpha=cfg["alpha_surv"],
                                  logits=parts["logits"])
             if not torch.isfinite(loss):
@@ -645,7 +705,8 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True, return_details=
             (loss / window_size).backward()
             if (i + 1) % gc == 0 or (i + 1) == len(loader):
                 if return_details:
-                    for name, module in (("tumor", model.tumor_scorer), ("node", model.node_scorer)):
+                    for name, module in (("tumor", model.tumor_scorer), ("node", model.node_scorer),
+                                         ("clinical", model.clinical_mlp)):
                         norm = _gradient_norm(module)
                         if norm is not None:
                             grad_norms[name].append(norm)
@@ -682,9 +743,36 @@ def run_epoch(model, loader, optimizer, cfg, device, train=True, return_details=
     return avg_loss, c_index
 
 
+def prepare_clinical_encoder(pt_train, cfg, out_dir):
+    if not cfg.get("use_clinical", False):
+        cfg["clinical_in_dim"] = 0
+        return None
+    columns = get_clinical_columns(pt_train, cfg)
+    encoder = ClinicalEncoder().fit(pt_train, clinical_cols=columns,
+                                    categorical_cols=cfg.get("categorical_cols"))
+    cfg["clinical_in_dim"] = encoder.output_dim
+    save_clinical_encoder(encoder, os.path.join(out_dir, "clinical_encoder.json"))
+    print(f"临床维度: {encoder.output_dim}; 数值: {encoder.numeric_cols}; "
+          f"类别: {encoder.categorical_cols}")
+    return encoder
+
+
 def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     os.makedirs(out_dir, exist_ok=True)
     set_seed(cfg["seed"])
+    cfg = dict(cfg)
+    cfg.setdefault("use_lymphnode", True)
+    cfg.setdefault("use_clinical", False)
+    cfg["numerics_version"] = NUMERICS_VERSION
+    time_bins = fit_time_bins(pt_train, cfg["n_bins"])
+    cfg["n_classes"] = time_bins["n_classes"]
+    pt_train = apply_time_bins(pt_train, time_bins)
+    pt_val = apply_time_bins(pt_val, time_bins) if pt_val is not None else None
+    with open(os.path.join(out_dir, "time_bins.json"), "w", encoding="utf-8") as f:
+        json.dump(time_bins, f, ensure_ascii=False, indent=2)
+    clinical_encoder = prepare_clinical_encoder(pt_train, cfg, out_dir)
+    with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     scaler = InputScaler().fit(pt_train)
     save_scaler(scaler, os.path.join(out_dir, "input_scaler.json"))
@@ -699,9 +787,10 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     print(f"[{fold_tag}] initial hazard priors: "
           + ", ".join(f"{p:.4f}" for p in head_init["hazard_priors"]))
     optimizer = get_optimizer(model, cfg)
-    train_loader = make_loader(pt_train, cfg, training=True, scaler=scaler)
+    train_loader = make_loader(pt_train, cfg, training=True, scaler=scaler,
+                                clinical_encoder=clinical_encoder)
     val_loader = (
-        make_loader(pt_val, cfg, training=False, scaler=scaler)
+        make_loader(pt_val, cfg, training=False, scaler=scaler, clinical_encoder=clinical_encoder)
         if pt_val is not None else None
     )
 
@@ -725,7 +814,7 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
             "hazard_scale": coeffs["hazard_scale"],
         }
         rec.update({f"train_{k}": v for k, v in tr_details["diagnostics"].items()})
-        for name in ("tumor", "node"):
+        for name in ("tumor", "node", "clinical"):
             norm = tr_details["diagnostics"].get(f"{name}_grad_norm_mean")
             if norm is not None:
                 print(f"[{fold_tag} epoch {epoch} grad] {name}: mean_norm={norm:.3e}")
@@ -844,10 +933,35 @@ def train_all(pt, cfg, device, log_dir):
 
 @torch.no_grad()
 def run_inference(cfg, device, args):
-    df = read_csv_smart(args.csv_path)
-    pt, _ = build_patient_table(df, cfg["target"], cfg["n_bins"], cfg)
-
     ckpt_dir = os.path.dirname(os.path.abspath(args.ckpt_path))
+    config_path = os.path.join(ckpt_dir, "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"未找到权重配套的训练折配置 {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    if cfg.get("numerics_version") != NUMERICS_VERSION:
+        raise ValueError(f"权重目录 config 的 numerics_version 必须为 {NUMERICS_VERSION}。")
+    bins_path = os.path.join(ckpt_dir, "time_bins.json")
+    if not os.path.isfile(bins_path):
+        raise FileNotFoundError(f"未找到训练折时间边界 {bins_path}，不能在测试集重新分箱。")
+    with open(bins_path, "r", encoding="utf-8") as f:
+        time_bins = json.load(f)
+    if int(cfg["n_classes"]) != time_bins["n_classes"]:
+        raise ValueError("时间边界与权重配置的 n_classes 不一致。")
+    clinical_encoder = None
+    if cfg.get("use_clinical", False):
+        encoder_path = os.path.join(ckpt_dir, "clinical_encoder.json")
+        if not os.path.isfile(encoder_path):
+            raise FileNotFoundError(f"临床融合权重必须配套 {encoder_path}，不能自动关闭临床。")
+        clinical_encoder = load_clinical_encoder(encoder_path)
+        if int(cfg["clinical_in_dim"]) != clinical_encoder.output_dim:
+            raise ValueError("临床编码器维度与权重配置不一致。")
+    clinical_columns = (clinical_encoder.numeric_cols + clinical_encoder.categorical_cols
+                         if clinical_encoder is not None else [])
+    df = read_csv_smart(args.csv_path)
+    pt, _ = build_patient_table(df, cfg["target"], cfg["n_bins"], cfg,
+                                 clinical_columns=clinical_columns)
+    pt = apply_time_bins(pt, time_bins)
     scaler_path = os.path.join(ckpt_dir, "input_scaler.json")
     if not os.path.isfile(scaler_path):
         raise FileNotFoundError(
@@ -856,20 +970,22 @@ def run_inference(cfg, device, args):
     scaler = load_scaler(scaler_path)
 
     model = build_model(cfg, device)
-    state = torch.load(args.ckpt_path, map_location=device)
+    state = torch.load(args.ckpt_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
     model.eval()
 
-    loader = make_loader(pt, cfg, training=False, scaler=scaler)
+    loader = make_loader(pt, cfg, training=False, scaler=scaler,
+                          clinical_encoder=clinical_encoder)
     rows, risks, censors, times = [], [], [], []
     for sample in loader:
         (tumor_feats, node_feats, size_norm, count_norm, has_met,
-         _label, et, c, cid, raw_size, raw_count) = sample
+         _label, et, c, cid, raw_size, raw_count, clinical) = sample
         tumor_feats = tumor_feats.to(device)
         node_feats = node_feats.to(device)
         hazards, S, parts = model(
             tumor_feats, node_feats,
             _scalar(size_norm, device), _scalar(count_norm, device), _scalar(has_met, device),
+            clinical.to(device),
         )
         rcb = float(parts["rcb"].cpu().view(-1)[0])
         rows.append({
@@ -907,6 +1023,10 @@ def run_inference(cfg, device, args):
         "n_node_positive": int(sum(1 for r in rows if r["n_metastatic_lymph_nodes"] > 0)),
         "c_index": c_index,
         "target": cfg["target"],
+        "use_lymphnode": cfg.get("use_lymphnode", True),
+        "use_clinical": cfg.get("use_clinical", False),
+        "fusion_type": cfg.get("fusion_type", "concat"),
+        "time_bins": time_bins,
         "formula": model.formula_coeffs(),
         "scaler": scaler.to_dict(),
         "ckpt_path": os.path.abspath(args.ckpt_path),
@@ -968,11 +1088,17 @@ def build_config(args):
         print(f"已从 {args.config} 覆盖超参数: {[k for k in override if k in HPARAM_KEYS]}")
     if args.mode == "infer" and saved_version != NUMERICS_VERSION:
         raise ValueError(
-            "该 config 来自旧版数值路径或缺少 numerics_version=3。"
-            "本修复改变了公式计算和可训练参数，请使用新实验名重新训练，"
-            "并将新版 config、权重和 input_scaler 配套用于推理；旧实验需沿用旧代码复现。"
+            f"该 config 来自旧版或缺少 numerics_version={NUMERICS_VERSION}。"
+            "请使用新实验名重新训练，并配套保存 config、scaler、时间边界及临床编码器。"
         )
     cfg["numerics_version"] = NUMERICS_VERSION
+    cfg.setdefault("use_lymphnode", True)
+    cfg.setdefault("use_clinical", False)
+    cfg.setdefault("fusion_type", "concat")
+    cfg.setdefault("clinical_hidden_dim", 128)
+    for key in ("use_lymphnode", "use_clinical"):
+        if not isinstance(cfg[key], bool):
+            raise ValueError(f"{key} 必须是 JSON 布尔值 true/false。")
     if args.mode == "train" and cfg["lr"] >= 1e-3:
         warnings.warn(f"lr={cfg['lr']:g} 容易使 WSI 评分饱和；建议先用 --lr 1e-4 并检查评分/梯度。",
                       RuntimeWarning)
@@ -982,7 +1108,7 @@ def build_config(args):
 
 
 def get_args():
-    p = argparse.ArgumentParser(description="RCB 风格预后训练/推理（无 a/b/c/d，保留 size/count）")
+    p = argparse.ArgumentParser(description="原发灶预后：可独立开启淋巴结与临床融合")
     p.add_argument("--mode", choices=["train", "infer"], default="train")
     p.add_argument("--csv_path", type=str, required=True, help="输入 CSV，列格式见 Example_Dataset_Csv.csv")
     p.add_argument("--log_root", type=str, default="./logs")
@@ -1013,6 +1139,21 @@ def get_args():
     p.add_argument("--in_dim", type=int, default=-1, help="特征维度，<=0 时从 h5 自动推断")
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--feat_key", type=str, default="features")
+    lymph = p.add_mutually_exclusive_group()
+    lymph.add_argument("--use_lymphnode", dest="use_lymphnode", action="store_true")
+    lymph.add_argument("--no_lymphnode", "--no-use_lymphnode", dest="use_lymphnode",
+                       action="store_false", help="关闭淋巴结影像和公式计数项")
+    clinical = p.add_mutually_exclusive_group()
+    clinical.add_argument("--use_clinical", dest="use_clinical", action="store_true")
+    clinical.add_argument("--no_clinical", "--no-use_clinical", dest="use_clinical",
+                          action="store_false")
+    p.set_defaults(use_lymphnode=True, use_clinical=False)
+    p.add_argument("--fusion_type", choices=["concat", "bilinear", "gated"], default="concat")
+    p.add_argument("--clinical_hidden_dim", type=int, default=128)
+    p.add_argument("--clinical_cols", type=str, default=None,
+                   help="逗号分隔临床列；未指定则自动筛选非标识/非结局/非结构输入列")
+    p.add_argument("--categorical_cols", type=str, default=None,
+                   help="额外明确按类别编码的临床列，逗号分隔")
 
     p.add_argument("--tumor_feat_col", type=str, default="tumor_slide_feat_path")
     p.add_argument("--ln_feat_col", type=str, default="lymph_node_slide_feat_path")
@@ -1031,11 +1172,6 @@ def main():
     if args.mode == "infer":
         assert args.ckpt_path and args.save_infer_dir, "推理需要 --ckpt_path 与 --save_infer_dir"
         assert args.config, "推理需要 --config 指定训练时保存的超参数 json"
-        if cfg.get("in_dim", -1) is None or cfg.get("in_dim", -1) <= 0:
-            df = read_csv_smart(args.csv_path)
-            cfg["in_dim"] = detect_in_dim(
-                df[cfg["tumor_feat_col"]].map(_clean_path).tolist(), cfg["feat_key"]
-            )
         set_seed(cfg["seed"])
         run_inference(cfg, device, args)
         return
@@ -1046,7 +1182,7 @@ def main():
     cfg["n_classes"] = int(n_classes)
     if cfg["in_dim"] is None or cfg["in_dim"] <= 0:
         cfg["in_dim"] = detect_in_dim(pt["tumor_slide_feat_path"].tolist(), cfg["feat_key"])
-    node_paths = [p for p in pt["lymph_node_slide_feat_path"].tolist() if p]
+    node_paths = [p for p in pt["lymph_node_slide_feat_path"].tolist() if p] if cfg["use_lymphnode"] else []
     if node_paths:
         node_dim = detect_in_dim(node_paths, cfg["feat_key"])
         if node_dim != cfg["in_dim"]:
@@ -1055,6 +1191,8 @@ def main():
     print(f"患者数: {len(pt)}, 事件数: {int((pt['censorship'] == 0).sum())}, "
           f"有淋巴结转移: {int(pt['has_met'].sum())}, "
           f"特征维度: {cfg['in_dim']}, n_classes: {cfg['n_classes']}")
+    print(f"淋巴结融合: {cfg['use_lymphnode']}; 临床融合: {cfg['use_clinical']}; "
+          f"临床方式: {cfg['fusion_type']}。实际时间边界与编码维度按训练折拟合。")
 
     log_dir = os.path.join(args.log_root, args.exp_name)
     os.makedirs(log_dir, exist_ok=True)
