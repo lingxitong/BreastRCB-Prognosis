@@ -1,29 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Modified: stable log-domain RCB/NLL, survival-head initialization and training diagnostics.
+# Modified: no trainable a/b/c/d; R = size_norm*tumor_score + count_norm*lymph_score,
+#           stable log-domain NLL, survival-head init, diagnostics.
 """
-淋巴结融合预后（RCB 风格公式）
+淋巴结融合预后（无公式系数版）
 ================================
-在 main 分支的离散时间生存训练流程上，把输入改成：
+保留 tumor_size 和 n_met，但去掉 a/b/c/d：
 
-  * 一张原发肿瘤切片特征
-  * 肿瘤长径 tumor_size
-  * 一张淋巴结切片特征（无转移时可空）
-  * 转移淋巴结个数 n_metastatic_lymph_nodes
+  R = tumor_size_norm * tumor_slide_score
+    + ln_count_norm  * lymph_slide_score     （无转移时第二项为 0）
 
-预后指数沿用乳腺 RCB 的两项相加结构，系数改为可训练：
+  - tumor_slide_score: 原发灶 WSI 经 MIL 编码器 -> (0,1)
+  - lymph_slide_score: 淋巴结 WSI 经 MIL 编码器 -> (0,1)
+  - tumor_size_norm / ln_count_norm 由训练集均值归一化
 
-  R = a * (tumor_size_norm * tumor_slide_score) ^ b
-    + c * (ln_count_norm * lymph_slide_score) ^ d
-
-转移淋巴结个数为 0 时，第二项强制为 0。
-a、c 通过 softplus 保持为正；b、d 通过 sigmoid 限制在 (0, 1)，
-初值对齐经典 RCB 的 1.4 与 0.17。
-
-切片评分由各自的 MIL 编码器从 WSI 特征中得到，范围 (0, 1)，
-对应 RCB 里的浸润比例 / 转移负荷，而不是手工估算。
 R 再经单调读出头变成离散时间 hazard，用 NLL 生存损失训练。
-c-index 直接用 R 排序（越大风险越高），因此排序只由该公式决定。
+c-index 直接用 R 排序（越大风险越高）。
 """
 
 from __future__ import print_function
@@ -45,7 +37,6 @@ from sklearn.model_selection import KFold
 
 
 def _builtin_cindex(censorships, event_times, risk_scores):
-    """Harrell's concordance index（含删失）的纯 numpy 实现。"""
     c = np.asarray(censorships)
     t = np.asarray(event_times, dtype=float)
     r = np.asarray(risk_scores, dtype=float)
@@ -108,10 +99,7 @@ TARGET_COLS = {
     "RFS": ("RFS_month", "RFS_status"),
 }
 
-# 经典 RCB（Symmans 2007）一次项系数与指数，用作 a/b/c/d 的初值
-RCB_INIT_SCALE = 1.4
-RCB_INIT_EXP = 0.17
-NUMERICS_VERSION = 2
+NUMERICS_VERSION = 3  # 去 a/b/c/d 版，与旧实验不兼容
 _EMPTY_TOKENS = {"", "nan", "none", "null", "na"}
 
 
@@ -140,7 +128,6 @@ def nll_surv_loss(hazards, S, Y, c, alpha=0.0, eps=1e-7, logits=None):
         )
         censored_loss = -c * torch.gather(log_survival_padded, 1, Y + 1)
         return (uncensored_loss + (1 - alpha) * censored_loss).mean()
-    # 保留概率输入接口；正式训练不经过这一兼容路径。
     if S is None:
         S = torch.cumprod(1 - hazards, dim=1)
     S_padded = torch.cat([torch.ones_like(c), S], 1)
@@ -205,7 +192,7 @@ class MeanMaxEncoder(nn.Module):
 
 
 class SlideScorer(nn.Module):
-    """MIL 表征 -> (0, 1) 切片评分，对应 RCB 中的比例/负荷项。"""
+    """MIL 表征 -> (0, 1) 切片评分。"""
 
     def __init__(self, encoder, score_norm="layernorm"):
         super().__init__()
@@ -236,53 +223,28 @@ def build_encoder(cfg):
     if mt == "max_mil":
         return MeanMaxEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"], pool="max")
     raise NotImplementedError(
-        f"淋巴结融合分支仅支持 model_type=abmil/mean_mil/max_mil，收到: {mt}"
+        f"仅支持 model_type=abmil/mean_mil/max_mil，收到: {mt}"
     )
 
 
 class RCBIndex(nn.Module):
     """
-    R = a * (size_norm * tumor_score) ^ b
-      + c * (count_norm * lymph_score) ^ d     （无转移时第二项为 0）
+    无 a/b/c/d：
+    R = tumor_size_norm * tumor_slide_score
+      + ln_count_norm  * lymph_slide_score     （无转移时第二项为 0）
     """
 
     def __init__(self):
-        super().__init__()
-        self.a_raw = nn.Parameter(torch.tensor(_inv_softplus(RCB_INIT_SCALE)))
-        self.b_raw = nn.Parameter(torch.tensor(_inv_sigmoid(RCB_INIT_EXP)))
-        self.c_raw = nn.Parameter(torch.tensor(_inv_softplus(RCB_INIT_SCALE)))
-        self.d_raw = nn.Parameter(torch.tensor(_inv_sigmoid(RCB_INIT_EXP)))
-
-    def coeff_values(self):
-        a = F.softplus(self.a_raw)
-        b = torch.sigmoid(self.b_raw)
-        c = F.softplus(self.c_raw)
-        d = torch.sigmoid(self.d_raw)
-        return a, b, c, d
+        super().__init__()  # 没有任何可训练参数
 
     def coeff_dict(self):
-        a, b, c, d = self.coeff_values()
-        return {
-            "a": float(a.detach().cpu()),
-            "b": float(b.detach().cpu()),
-            "c": float(c.detach().cpu()),
-            "d": float(d.detach().cpu()),
-        }
+        return {}
 
-    def forward(self, tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met,
-                tumor_log_score=None, lymph_log_score=None):
-        a, b, c, d = self.coeff_values()
-        # 不对 size * score 硬截断；logsigmoid 在 sigmoid 已下溢时仍保留梯度。
-        log_score_t = (torch.log(tumor_score) if tumor_log_score is None
-                       else tumor_log_score).view(1, 1)
-        log_base_t = torch.log(tumor_size_norm.view(1, 1)) + log_score_t
-        tumor_term = a * torch.exp(b * log_base_t)
+    def forward(self, tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met):
+        tumor_term = tumor_size_norm.view(1, 1) * tumor_score.view(1, 1)
 
         if float(has_met.detach().view(-1)[0]) > 0:
-            log_score_n = (torch.log(lymph_score) if lymph_log_score is None
-                           else lymph_log_score).view(1, 1)
-            log_base_n = torch.log(ln_count_norm.view(1, 1)) + log_score_n
-            lymph_term = c * torch.exp(d * log_base_n)
+            lymph_term = ln_count_norm.view(1, 1) * lymph_score.view(1, 1)
         else:
             lymph_term = tumor_term.new_zeros((1, 1))
 
@@ -291,21 +253,18 @@ class RCBIndex(nn.Module):
 
 
 class RCBPrognosisModel(nn.Module):
-    """双路切片评分 + RCB 公式 + 单调离散时间读出。"""
+    """双路 WSI 评分 + size/count 线性组合 + 单调离散时间读出。"""
 
     def __init__(self, tumor_encoder, node_encoder, n_classes, score_norm="layernorm"):
         super().__init__()
         self.tumor_scorer = SlideScorer(tumor_encoder, score_norm)
         self.node_scorer = SlideScorer(node_encoder, score_norm)
         self.rcb = RCBIndex()
-        # softplus 后为正，保证 R 越大、每个时间箱的 hazard 越高
         self.hazard_scale_raw = nn.Parameter(torch.tensor(_inv_softplus(0.1)))
         self.bin_bias = nn.Parameter(torch.full((n_classes,), _inv_sigmoid(0.1)))
 
     def formula_coeffs(self):
-        coeffs = self.rcb.coeff_dict()
-        coeffs["hazard_scale"] = float(F.softplus(self.hazard_scale_raw).detach().cpu())
-        return coeffs
+        return {"hazard_scale": float(F.softplus(self.hazard_scale_raw).detach().cpu())}
 
     def forward(self, tumor_feats, node_feats, tumor_size_norm, ln_count_norm, has_met):
         tumor_logit = self.tumor_scorer.forward_logits(tumor_feats)
@@ -321,8 +280,7 @@ class RCBPrognosisModel(nn.Module):
             lymph_log_score = tumor_logit.new_full((1, 1), float("nan"))
 
         rcb, tumor_term, lymph_term = self.rcb(
-            tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met,
-            tumor_log_score=tumor_log_score, lymph_log_score=lymph_log_score,
+            tumor_score, tumor_size_norm, lymph_score, ln_count_norm, has_met
         )
         scale = F.softplus(self.hazard_scale_raw)
         logits = rcb * scale + self.bin_bias.view(1, -1)
@@ -352,7 +310,8 @@ def build_model(cfg, device):
 
 
 def formula_param_ids(model):
-    ids = {id(p) for p in model.rcb.parameters()}
+    # rcb 无参数，只保留 hazard_scale 和 bin_bias 不做 weight decay
+    ids = set()
     ids.add(id(model.hazard_scale_raw))
     ids.add(id(model.bin_bias))
     return ids
@@ -471,8 +430,7 @@ def build_patient_table(df, target, n_bins, cfg):
             "has_met": int(has_met),
         })
     if n_dup:
-        print(f"警告: {n_dup} 个 case_id 有多行，仅使用每个患者的第一行"
-              f"（本任务约定一张原发灶 + 一张淋巴结）。")
+        print(f"警告: {n_dup} 个 case_id 有多行，仅使用每个患者的第一行。")
     if problems:
         preview = "\n".join(problems[:12])
         extra = "" if len(problems) <= 12 else f"\n... 另有 {len(problems) - 12} 条"
@@ -487,7 +445,7 @@ def build_patient_table(df, target, n_bins, cfg):
 
 
 class InputScaler:
-    """训练集上的尺度。除以常数不改变 a*(x)^b 这一函数族的表达能力，只避免数值过大。"""
+    """训练集上的尺度，只避免数值过大，不改变 R 的排序。"""
 
     def __init__(self):
         self.tumor_size_scale = 1.0
@@ -505,10 +463,8 @@ class InputScaler:
         return self
 
     def to_dict(self):
-        return {
-            "tumor_size_scale": self.tumor_size_scale,
-            "ln_count_scale": self.ln_count_scale,
-        }
+        return {"tumor_size_scale": self.tumor_size_scale,
+                "ln_count_scale": self.ln_count_scale}
 
     @classmethod
     def from_dict(cls, data):
@@ -585,7 +541,7 @@ def _scalar(value, device):
 
 @torch.no_grad()
 def initialize_survival_head(model, pt_train, scaler):
-    """仅用训练折事件/在险人数初始化 baseline，避免初始 hazard 普遍大于 0.5。"""
+    """仅用训练折事件/在险人数初始化 baseline；reference_risk 用 size/count 均值乘 0.5。"""
     labels = pt_train["disc_label"].to_numpy()
     events = pt_train["censorship"].to_numpy() == 0
     priors = []
@@ -593,12 +549,11 @@ def initialize_survival_head(model, pt_train, scaler):
         n_at_risk = int(np.sum(labels >= k))
         n_events = int(np.sum(events & (labels == k)))
         priors.append((n_events + 0.5) / (n_at_risk + 1) if n_at_risk else 0.1)
-    coeffs = model.rcb.coeff_dict()
-    a, b, c, d = (coeffs[key] for key in ("a", "b", "c", "d"))
+
     size = pt_train["tumor_size"].to_numpy() / scaler.tumor_size_scale
     count = pt_train["n_met"].to_numpy() / scaler.ln_count_scale
-    reference_risk = float(np.mean(a * (0.5 * size) ** b
-                                   + c * (0.5 * count) ** d))
+    reference_risk = float(np.mean(0.5 * size + 0.5 * count))
+
     h = model.bin_bias.new_tensor(priors)
     scale = F.softplus(model.hazard_scale_raw)
     model.bin_bias.copy_(torch.logit(h) - scale * reference_risk)
@@ -616,7 +571,6 @@ def _gradient_norm(module):
 
 
 def prediction_diagnostics(rows):
-    """淋巴结统计仅包含有转移者，避免正常的缺失分支 0 掩盖评分分布。"""
     stats = {}
     for key in ("rcb", "tumor_score", "lymph_score", "tumor_logit", "lymph_logit"):
         selected = rows if not key.startswith("lymph") else [r for r in rows if r["has_met"]]
@@ -768,15 +722,14 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
             "epoch": epoch,
             "train_loss": tr_loss,
             "train_cindex": tr_cidx,
-            "a": coeffs["a"], "b": coeffs["b"], "c": coeffs["c"], "d": coeffs["d"],
+            "hazard_scale": coeffs["hazard_scale"],
         }
         rec.update({f"train_{k}": v for k, v in tr_details["diagnostics"].items()})
         for name in ("tumor", "node"):
             norm = tr_details["diagnostics"].get(f"{name}_grad_norm_mean")
             if norm is not None:
                 print(f"[{fold_tag} epoch {epoch} grad] {name}: mean_norm={norm:.3e}")
-        coeff_txt = (f"a={coeffs['a']:.3f} b={coeffs['b']:.3f} "
-                     f"c={coeffs['c']:.3f} d={coeffs['d']:.3f}")
+        coeff_txt = f"hazard_scale={coeffs['hazard_scale']:.3f}"
         if val_loader is not None:
             val_loss, val_cidx, val_details = run_epoch(
                 model, val_loader, optimizer, cfg, device, train=False, return_details=True)
@@ -807,7 +760,6 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
                   f"train_cindex={tr_cidx:.4f} {coeff_txt}")
             print_diagnostics(tr_details["diagnostics"], f"{fold_tag} epoch {epoch} train")
         history.append(rec)
-        # 每轮落盘，训练中断后仍可检查梯度、评分和指标。
         pd.DataFrame(history).to_csv(os.path.join(out_dir, "metrics.csv"), index=False)
 
     torch.save(model.state_dict(), ckpt_last)
@@ -1016,8 +968,8 @@ def build_config(args):
         print(f"已从 {args.config} 覆盖超参数: {[k for k in override if k in HPARAM_KEYS]}")
     if args.mode == "infer" and saved_version != NUMERICS_VERSION:
         raise ValueError(
-            "该 config 来自旧版数值路径或缺少 numerics_version=2。"
-            "本修复改变了评分归一化和低分区域的公式计算，请使用新实验名重新训练，"
+            "该 config 来自旧版数值路径或缺少 numerics_version=3。"
+            "本修复改变了公式计算和可训练参数，请使用新实验名重新训练，"
             "并将新版 config、权重和 input_scaler 配套用于推理；旧实验需沿用旧代码复现。"
         )
     cfg["numerics_version"] = NUMERICS_VERSION
@@ -1030,7 +982,7 @@ def build_config(args):
 
 
 def get_args():
-    p = argparse.ArgumentParser(description="原发灶 + 淋巴结的 RCB 风格预后训练/推理")
+    p = argparse.ArgumentParser(description="RCB 风格预后训练/推理（无 a/b/c/d，保留 size/count）")
     p.add_argument("--mode", choices=["train", "infer"], default="train")
     p.add_argument("--csv_path", type=str, required=True, help="输入 CSV，列格式见 Example_Dataset_Csv.csv")
     p.add_argument("--log_root", type=str, default="./logs")

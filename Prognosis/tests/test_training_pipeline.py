@@ -178,7 +178,7 @@ class TrainingPipelineTests(unittest.TestCase):
                     self.assertTrue((best.loc[no_met, "lymph_term"] == 0).all())
                     self.assertTrue((best.loc[no_met, "lymph_score"] == 0).all())
 
-    def test_survival_head_matches_known_training_prior_and_rcb_formula(self):
+    def test_survival_head_matches_known_training_prior_and_linear_rcb_formula(self):
         cfg = small_config()
         cfg["n_classes"] = 4
         model = prognosis.build_model(cfg, torch.device("cpu"))
@@ -192,10 +192,10 @@ class TrainingPipelineTests(unittest.TestCase):
         details = prognosis.initialize_survival_head(model, pt_train, scaler)
         expected_priors = np.array([0.3, 0.5, 0.75, 0.1])
         np.testing.assert_allclose(details["hazard_priors"], expected_priors)
-        a, b, c, d = model.rcb.coeff_dict().values()
         sizes = pt_train["tumor_size"].to_numpy() / 4.0
         counts = pt_train["n_met"].to_numpy() / 2.0
-        expected_reference = np.mean(a * (sizes * 0.5) ** b + c * (counts * 0.5) ** d)
+        expected_reference = np.mean(0.5 * sizes + 0.5 * counts)
+        self.assertAlmostEqual(expected_reference, 0.75)
         self.assertAlmostEqual(details["reference_risk"], expected_reference)
         actual_priors = torch.sigmoid(model.bin_bias.detach()
                                      + torch.nn.functional.softplus(model.hazard_scale_raw.detach())
@@ -225,7 +225,8 @@ class InputContractTests(unittest.TestCase):
     def test_inference_rejects_legacy_or_missing_versioned_config(self):
         with tempfile.TemporaryDirectory(prefix="rcb_config_") as tmp:
             path = Path(tmp) / "config.json"
-            for version in (None, 1, prognosis.NUMERICS_VERSION + 1):
+            self.assertEqual(prognosis.NUMERICS_VERSION, 3)
+            for version in (None, 1, 2, prognosis.NUMERICS_VERSION + 1):
                 with self.subTest(version=version):
                     cfg = small_config()
                     if version is None:
@@ -236,6 +237,10 @@ class InputContractTests(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()):
                         with self.assertRaisesRegex(ValueError, "numerics_version"):
                             prognosis.build_config(Namespace(mode="infer", config=str(path)))
+            path.write_text(json.dumps(small_config()), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                loaded = prognosis.build_config(Namespace(mode="infer", config=str(path)))
+            self.assertEqual(loaded["numerics_version"], 3)
             with self.assertRaisesRegex(ValueError, "numerics_version"):
                 prognosis.build_config(Namespace(mode="infer", config=None))
 

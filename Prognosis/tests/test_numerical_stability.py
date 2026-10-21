@@ -12,7 +12,6 @@ import unittest
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -44,56 +43,51 @@ def small_model(model_type="abmil"):
 
 
 class RCBNumericalStabilityTests(unittest.TestCase):
-    def test_extreme_negative_scores_keep_gradients_below_old_floor(self):
-        """The log-score path must still learn after float32 sigmoid underflow."""
-        rcb = prognosis.RCBIndex()
-        tumor_logit = tensor([[-100.0]]).requires_grad_()
-        lymph_logit = tensor([[-100.0]]).requires_grad_()
-        risk, tumor_term, lymph_term = rcb(
-            tumor_logit.sigmoid(),
-            tensor([[1.0]]),
-            lymph_logit.sigmoid(),
-            tensor([[1.0]]),
-            tensor([[1.0]]),
-            tumor_log_score=F.logsigmoid(tumor_logit),
-            lymph_log_score=F.logsigmoid(lymph_logit),
-        )
-        self.assertTrue(torch.isfinite(risk).all())
-        self.assertGreater(float(risk.detach()), 0.0)
-        # A 1e-4 floor on size*score used to produce an artificial term ~0.29.
-        self.assertLess(float(tumor_term.detach()), 1e-4)
-        self.assertLess(float(lymph_term.detach()), 1e-4)
-        risk.sum().backward()
-        for name, logit in (("tumor", tumor_logit), ("lymph", lymph_logit)):
-            with self.subTest(branch=name):
-                self.assertIsNotNone(logit.grad)
-                self.assertTrue(torch.isfinite(logit.grad).all())
-                self.assertGreater(float(logit.grad.abs().sum()), 0.0)
-
-    def test_normal_scores_preserve_original_rcb_formula(self):
+    def test_linear_rcb_gradients_match_sigmoid_chain_rule(self):
+        """Each WSI branch contributes its normalized size/count times score."""
         rcb = prognosis.RCBIndex().double()
-        tumor_score = tensor([[0.32]], dtype=torch.float64)
-        lymph_score = tensor([[0.71]], dtype=torch.float64)
-        size = tensor([[0.43]], dtype=torch.float64)
-        count = tensor([[1.73]], dtype=torch.float64)
-        expected_a, expected_b, expected_c, expected_d = rcb.coeff_values()
-        expected_tumor = expected_a * (size * tumor_score).pow(expected_b)
-        expected_lymph = expected_c * (count * lymph_score).pow(expected_d)
-        for log_scores in (False, True):
-            with self.subTest(log_scores=log_scores):
-                kwargs = {}
-                if log_scores:
-                    kwargs = {
-                        "tumor_log_score": tumor_score.log(),
-                        "lymph_log_score": lymph_score.log(),
-                    }
+        tumor_logit = tensor([[-2.0]], dtype=torch.float64).requires_grad_()
+        lymph_logit = tensor([[1.5]], dtype=torch.float64).requires_grad_()
+        tumor_score = tumor_logit.sigmoid()
+        lymph_score = lymph_logit.sigmoid()
+        size = tensor([[0.43]], dtype=torch.float64).requires_grad_()
+        count = tensor([[1.73]], dtype=torch.float64).requires_grad_()
+        risk, tumor_term, lymph_term = rcb(
+            tumor_score, size, lymph_score, count,
+            tensor([[1.0]], dtype=torch.float64),
+        )
+        torch.testing.assert_close(tumor_term, size * tumor_score)
+        torch.testing.assert_close(lymph_term, count * lymph_score)
+        risk.sum().backward()
+        torch.testing.assert_close(
+            tumor_logit.grad, size.detach() * tumor_score.detach() * (1 - tumor_score.detach()),
+        )
+        torch.testing.assert_close(
+            lymph_logit.grad, count.detach() * lymph_score.detach() * (1 - lymph_score.detach()),
+        )
+        torch.testing.assert_close(size.grad, tumor_score.detach())
+        torch.testing.assert_close(count.grad, lymph_score.detach())
+
+    def test_linear_formula_has_no_coefficients_or_score_floor(self):
+        rcb = prognosis.RCBIndex().double()
+        self.assertEqual(list(rcb.parameters()), [])
+        self.assertEqual(rcb.coeff_dict(), {})
+        self.assertEqual(dict(rcb.state_dict()), {})
+        for score_values in ((0.32, 0.71), (1e-8, 2e-8), (0.0, 0.0)):
+            with self.subTest(scores=score_values):
+                tumor_score = tensor([[score_values[0]]], dtype=torch.float64)
+                lymph_score = tensor([[score_values[1]]], dtype=torch.float64)
+                size = tensor([[0.43]], dtype=torch.float64)
+                count = tensor([[1.73]], dtype=torch.float64)
+                expected_tumor = size * tumor_score
+                expected_lymph = count * lymph_score
                 risk, tumor_term, lymph_term = rcb(
                     tumor_score, size, lymph_score, count,
-                    tensor([[1.0]], dtype=torch.float64), **kwargs,
+                    tensor([[1.0]], dtype=torch.float64),
                 )
-                torch.testing.assert_close(tumor_term, expected_tumor)
-                torch.testing.assert_close(lymph_term, expected_lymph)
-                torch.testing.assert_close(risk, expected_tumor + expected_lymph)
+                torch.testing.assert_close(tumor_term, expected_tumor, rtol=0, atol=0)
+                torch.testing.assert_close(lymph_term, expected_lymph, rtol=0, atol=0)
+                torch.testing.assert_close(risk, expected_tumor + expected_lymph, rtol=0, atol=0)
 
     def test_no_metastasis_has_exact_zero_node_term_and_no_node_gradients(self):
         torch.manual_seed(7)
