@@ -40,6 +40,10 @@ from clinical_utils import (
     ClinicalEncoder, build_fusion, get_clinical_columns,
     load_clinical_encoder, save_clinical_encoder,
 )
+from mil_encoders import (
+    MODEL_REGISTRY, MIL_HPARAM_DEFAULTS, MILInstanceLimiter, build_extra_encoder,
+    canonical_model_name, print_model_list, validate_mil_config,
+)
 
 
 def _builtin_cindex(censorships, event_times, risk_scores):
@@ -100,6 +104,7 @@ HPARAM_KEYS = [
     "use_lymphnode", "use_clinical", "fusion_type", "clinical_hidden_dim",
     "clinical_in_dim", "clinical_cols", "categorical_cols",
 ]
+HPARAM_KEYS.extend(MIL_HPARAM_DEFAULTS)
 
 TARGET_COLS = {
     "OS": ("OS_month", "OS_status"),
@@ -231,16 +236,18 @@ class SlideScorer(nn.Module):
 
 
 def build_encoder(cfg):
-    mt = cfg["model_type"]
+    mt = validate_mil_config(cfg)
     if mt == "abmil":
-        return ABMILEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"])
-    if mt == "mean_mil":
-        return MeanMaxEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"], pool="mean")
-    if mt == "max_mil":
-        return MeanMaxEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"], pool="max")
-    raise NotImplementedError(
-        f"仅支持 model_type=abmil/mean_mil/max_mil，收到: {mt}"
-    )
+        encoder = ABMILEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"])
+    elif mt == "mean_mil":
+        encoder = MeanMaxEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"], pool="mean")
+    elif mt == "max_mil":
+        encoder = MeanMaxEncoder(cfg["in_dim"], dropout=cfg["drop_out"], hidden=cfg["hidden_dim"], pool="max")
+    else:
+        encoder = build_extra_encoder(dict(cfg, model_type=mt))
+    # 旧配置没有此字段，维持完整 bag 与原 checkpoint 参数路径兼容。
+    limit = cfg.get("mil_max_instances", 0)
+    return MILInstanceLimiter(encoder, limit) if limit else encoder
 
 
 class RCBIndex(nn.Module):
@@ -764,6 +771,8 @@ def train_one_run(pt_train, pt_val, cfg, device, out_dir, fold_tag=""):
     cfg.setdefault("use_lymphnode", True)
     cfg.setdefault("use_clinical", False)
     cfg["numerics_version"] = NUMERICS_VERSION
+    cfg["model_type"] = canonical_model_name(cfg.get("model_type", "abmil"))
+    validate_mil_config(cfg)
     time_bins = fit_time_bins(pt_train, cfg["n_bins"])
     cfg["n_classes"] = time_bins["n_classes"]
     pt_train = apply_time_bins(pt_train, time_bins)
@@ -941,6 +950,8 @@ def run_inference(cfg, device, args):
         cfg = json.load(f)
     if cfg.get("numerics_version") != NUMERICS_VERSION:
         raise ValueError(f"权重目录 config 的 numerics_version 必须为 {NUMERICS_VERSION}。")
+    print(f"已加载 MIL: {cfg['model_type']}; 每张切片 patch 上限: "
+          f"{cfg.get('mil_max_instances', 0) or '不限'}（采用权重目录配置）。")
     bins_path = os.path.join(ckpt_dir, "time_bins.json")
     if not os.path.isfile(bins_path):
         raise FileNotFoundError(f"未找到训练折时间边界 {bins_path}，不能在测试集重新分箱。")
@@ -1092,6 +1103,8 @@ def build_config(args):
             "请使用新实验名重新训练，并配套保存 config、scaler、时间边界及临床编码器。"
         )
     cfg["numerics_version"] = NUMERICS_VERSION
+    cfg["model_type"] = canonical_model_name(cfg.get("model_type", "abmil"))
+    validate_mil_config(cfg)
     cfg.setdefault("use_lymphnode", True)
     cfg.setdefault("use_clinical", False)
     cfg.setdefault("fusion_type", "concat")
@@ -1110,7 +1123,8 @@ def build_config(args):
 def get_args():
     p = argparse.ArgumentParser(description="原发灶预后：可独立开启淋巴结与临床融合")
     p.add_argument("--mode", choices=["train", "infer"], default="train")
-    p.add_argument("--csv_path", type=str, required=True, help="输入 CSV，列格式见 Example_Dataset_Csv.csv")
+    p.add_argument("--csv_path", type=str, default=None, help="输入 CSV，列格式见 Example_Dataset_Csv.csv")
+    p.add_argument("--list_models", action="store_true", help="列出全部 MIL 模型后退出，不需要 CSV")
     p.add_argument("--log_root", type=str, default="./logs")
     p.add_argument("--exp_name", type=str, default="exp")
     p.add_argument("--config", type=str, default=None, help="超参数 json")
@@ -1135,10 +1149,26 @@ def get_args():
                    help="评分前对切片表征做无可训练参数的 LayerNorm；none 用于消融")
     p.add_argument("--grad_clip", type=float, default=5.0, help="梯度范数裁剪阈值；0 表示禁用")
 
-    p.add_argument("--model_type", choices=["abmil", "mean_mil", "max_mil"], default="abmil")
+    p.add_argument("--model_type", type=canonical_model_name, choices=list(MODEL_REGISTRY), default="abmil")
     p.add_argument("--in_dim", type=int, default=-1, help="特征维度，<=0 时从 h5 自动推断")
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--feat_key", type=str, default="features")
+    mil_group = p.add_argument_group("MIL encoder options")
+    mil_help = {
+        "mil_max_instances": "每张切片最大 patch 数；训练随机选择、推理确定性等间隔选择；0=不限",
+        "mil_attention_dim": "注意力中间维度",
+        "mil_heads": "多头数或 Fourier 频域分组数，须整除 hidden_dim",
+        "mil_depth": "ILRA/Lin/Fourier 层数",
+        "mil_inducing_points": "ILRA 低秩潜变量数量",
+        "mil_tokens": "ACMIL token 数",
+        "mil_rank": "MR-ABMIL 低秩残差 rank",
+        "mil_subspace_dim": "nnMIL 每个特征子空间的宽度",
+        "mil_topk": "Top-k 池化每通道取值数",
+        "mil_lse_temperature": "LogSumExp 池化温度",
+        "mil_gem_p": "GeM 可学习幂的初值，必须 >1",
+    }
+    for key, default in MIL_HPARAM_DEFAULTS.items():
+        mil_group.add_argument("--" + key, type=type(default), default=default, help=mil_help[key])
     lymph = p.add_mutually_exclusive_group()
     lymph.add_argument("--use_lymphnode", dest="use_lymphnode", action="store_true")
     lymph.add_argument("--no_lymphnode", "--no-use_lymphnode", dest="use_lymphnode",
@@ -1160,14 +1190,23 @@ def get_args():
     p.add_argument("--tumor_size_col", type=str, default="tumor_size", help="肿瘤长径列名")
     p.add_argument("--ln_count_col", type=str, default="n_metastatic_lymph_nodes",
                    help="转移淋巴结个数列名")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.list_models and not args.csv_path:
+        p.error("除 --list_models 外，必须提供 --csv_path。")
+    return args
 
 
 def main():
     args = get_args()
+    if args.list_models:
+        print_model_list()
+        return
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
     cfg = build_config(args)
+    if args.mode == "train":
+        print(f"MIL: {cfg['model_type']}; 每张切片 patch 上限: "
+              f"{cfg.get('mil_max_instances', 0) or '不限'}。完整参数写入 config.json。")
 
     if args.mode == "infer":
         assert args.ckpt_path and args.save_infer_dir, "推理需要 --ckpt_path 与 --save_infer_dir"

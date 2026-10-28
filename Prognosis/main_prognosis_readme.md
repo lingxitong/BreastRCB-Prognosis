@@ -1,11 +1,91 @@
-# 原发灶预后：淋巴结和临床信息独立开关
+# Multi-MIL 预后：淋巴结和临床信息独立开关
 
-当前分支 `prognosis_with_lymphnode_and_clinical` 合并了两个来源分支：
+当前分支 `prognosis_with_lymphnode_and_clinical_multi_mil` 从 `prognosis_with_lymphnode_and_clinical@20db2e3` 复制，并参考 `MIL_BASELINE@e1c5d9fcd771f30f94437e993ecf24c0535df991` 扩展 MIL。保留以下两个来源的融合逻辑：
 
 - `prognosis_with_lymphnode`：按用户提供的 `main_prognosis2.py` 更新后的简化公式。
 - `prognosis_with_clinical_info`：临床编码器及 concat/bilinear/gated 中期融合。
 
 正式入口为 `Prognosis/main_prognosis.py`，输入是预提取的 H5 patch 特征。支持 OS、DFS 和 RFS 生存预测。
+
+## 16 种 MIL 选择
+
+以下均为独立 canonical 选项，别名不重复计数。原有 3 种保留，新增 13 种：
+
+- `abmil`：原有 gated attention，包含 tanh 与 sigmoid 门控。
+- `mean_mil`：原有均值池化。
+- `max_mil`：原有最大池化。
+- `attention_mil`：参考 AB_MIL 的普通 tanh 注意力，与 gated ABMIL 不同。
+- `rrt_mil`：参考库的轻量残差 MLP 重嵌入加注意力，不是完整区域 Transformer。
+- `dg_mil`：参考库的投影、BatchNorm、注意力轻量版本；单 patch 训练使用已有 BN 统计。
+- `ca_mil`：上下文 QKV 建模后聚合，计算量随 patch 数平方增长，建议保留 patch 上限。
+- `ilra_mil`：低秩潜变量双向交互加 non-local pooling。
+- `lin_mil`：ReLU kernel 线性注意力与 CLS 表征。
+- `fourier_mil`：APFF 频域过滤加 CLS，使用 H5 内存储的 patch 顺序，不保证任意重排不变。
+- `mr_abmil`：冻结仿射注意力映射加可训练非线性低秩残差。
+- `nn_mil`：训练随机特征子空间、推理固定子空间覆盖，不含原分类均衡训练流程。
+- `acmil`：多 token QK 聚合器适配，不含 sub-classifier、diversity loss 或 masking curriculum。
+- `topk_mil`：新增通用对照，逐特征通道 top-k 值取均值。
+- `lse_mil`：新增通用对照，按 patch 数归一化的稳定 log-mean-exp 池化。
+- `gem_mil`：新增通用对照，可学习幂的广义均值池化。
+
+其中 10 种新增聚合器参考 MIL_BASELINE，Top-k/LSE/GeM 为额外简单池化对照；不声称完整复现 13 篇不同论文。编码器统一输出 `[1, hidden_dim]`，再接相同临床融合、评分头、风险公式和生存损失。未引入 Mamba、图坐标、外部 confounder 或自定义 CUDA 编译依赖。来源与许可见根目录 `THIRD_PARTY_NOTICES.md`。
+
+无需 CSV 即可列出模型：
+
+```bash
+python Prognosis/main_prognosis.py --list_models
+```
+
+只需改变 `--model_type` 即可选择。兼容部分参考名称：`AB_MIL` 对应 `attention_mil`，`GATE_AB_MIL` 对应 `abmil`，`MR_AB_MIL` 对应 `mr_abmil`，`AC_MIL` 对应 `acmil`，如 `ILRA_MIL` 会规范为 `ilra_mil`。配置保存规范名称。
+
+## Patch 预算与 MIL 参数
+
+新 CLI 默认 `--mil_max_instances 4096`，对全部 16 种模型采用相同每张切片预算；设为 0 表示不限。训练每次从超长 bag 无重复随机取样并保留原索引顺序；验证/推理使用等间隔确定性索引，不依赖随机种子。原发灶和淋巴结各自应用预算。
+
+预算限制模型计算和激活，不限制解码完整 H5 的 CPU 内存，也不生成空间坐标。公平比较请固定预算、数据划分和 seed。预算以内的 bag 不丢 patch；Fourier 保留所选 patch 的存储顺序。
+
+可选参数均有默认值，无需逐一填写：
+
+- `--mil_attention_dim 128`：注意力中间维度。
+- `--mil_heads 4`：ILRA/Lin/ACMIL 多头数、Fourier 频域分组数，须整除 `hidden_dim`。
+- `--mil_depth 2`：ILRA/Lin/Fourier 层数。
+- `--mil_inducing_points 16`：ILRA 潜变量数量。
+- `--mil_tokens 5`：ACMIL token 数。
+- `--mil_rank 32`：MR-ABMIL 残差 rank。
+- `--mil_subspace_dim 128`：nnMIL 特征子空间宽度，推理使用固定 seed 的不重叠为主覆盖。
+- `--mil_topk 8`：Top-k 每通道选取数，自动不超过 bag 长度。
+- `--mil_lse_temperature 1.0`：LSE 温度。
+- `--mil_gem_p 3.0`：GeM 可学习幂初值，必须大于 1。
+
+参数全部保存到每折配置，推理按权重目录配置恢复。LayerNorm、dropout、学习率与临床融合参数沿用本脚本设置。
+
+### ILRA 双融合训练示例
+
+```bash
+python Prognosis/main_prognosis.py --mode train --split_mode kfold --target DFS \
+    --csv_path /path/to/dataset.csv --log_root ./logs --exp_name dfs_ilra_both \
+    --model_type ilra_mil --mil_max_instances 4096 --mil_heads 4 --mil_depth 2 \
+    --k 5 --max_epochs 50 --lr 1e-4 \
+    --use_lymphnode --use_clinical --fusion_type concat \
+    --clinical_cols Age,ER_status,HER2_score_pre,Molecular_subtype
+```
+
+### 同一配置比较全部模型
+
+```bash
+for model in abmil mean_mil max_mil attention_mil rrt_mil dg_mil ca_mil \
+             ilra_mil lin_mil fourier_mil mr_abmil nn_mil acmil \
+             topk_mil lse_mil gem_mil; do
+    python Prognosis/main_prognosis.py --mode train --split_mode kfold --target DFS \
+        --csv_path /path/to/dataset.csv --log_root ./logs --exp_name "dfs_${model}_both" \
+        --model_type "$model" --mil_max_instances 4096 --seed 1 \
+        --k 5 --max_epochs 50 --lr 1e-4 \
+        --use_lymphnode --use_clinical --fusion_type concat \
+        --clinical_cols Age,ER_status,HER2_score_pre,Molecular_subtype
+done
+```
+
+各模型独立实验目录，循环按顺序运行；替换实际 CSV 路径后使用。原有四种融合组合仍使用后文独立开关。
 
 ## 两个独立开关
 
@@ -121,7 +201,7 @@ python Prognosis/main_prognosis.py --mode train --split_mode kfold --target DFS 
     --clinical_cols Age,ER_status,HER2_score_pre,Molecular_subtype
 ```
 
-可把 `concat` 改成 `bilinear/gated`。`--model_type` 支持 `abmil/mean_mil/max_mil`。全量训练将 `--split_mode kfold` 改为 `--split_mode all_train`，并使用新的实验名。默认 `--gc 16`、`--drop_out 0.25`、`--num_workers 2`、`--score_norm layernorm`、`--grad_clip 5`。也支持 `--config /path/to/hparams.json`，配置文件中的值覆盖命令行对应超参数，布尔开关在 JSON 中使用 true/false。
+可把 `concat` 改成 `bilinear/gated`，把 `abmil` 改成上面的任意 MIL。全量训练将 `--split_mode kfold` 改为 `--split_mode all_train`，并使用新的实验名。默认 `--gc 16`、`--drop_out 0.25`、`--num_workers 2`、`--score_norm layernorm`、`--grad_clip 5`。也支持 `--config /path/to/hparams.json`，配置文件中的值覆盖命令行对应超参数，布尔开关在 JSON 中使用 true/false。
 
 ## 推理与配置版本
 
@@ -134,7 +214,7 @@ python Prognosis/main_prognosis.py --mode infer \
 
 推理实际从权重目录加载该折 `config.json`、`input_scaler.json`、`time_bins.json`；临床开启还必须有 `clinical_encoder.json`。缺少临床编码器时明确报错，不会静默关闭临床。推理的开关、融合结构与特征维度采用训练折配置，不通过命令行改变训练好的模型。
 
-本分支 `numerics_version=4`。原无系数分支为版本 3，旧幂公式为版本 2，权重及配置不能跨版本混用，需新实验名重新训练。
+本分支沿用 `numerics_version=4`。原有三种模型的旧版 v4 配置没有 MIL 专属字段时，采用不限 patch 的路径并保留原参数结构，可复用配套的原 v4 权重。新训练保存完整 MIL 参数和预算；不要给旧权重套用另一个实验的新配置。原无系数分支 v3、旧幂公式 v2 仍不兼容。
 
 ## 输出与诊断
 
@@ -146,10 +226,12 @@ K 折根目录保存请求的 `config.json` 和 `kfold_summary.json`，每折保
 
 ## 测试与依赖
 
-必需 `torch`、`numpy`、`pandas`、`h5py`、`scikit-learn`；C-index 可选 `scikit-survival/lifelines`，没有则使用内置实现。推荐 Python 3.9+。
+必需 PyTorch 2.0+、`numpy`、`pandas`、`h5py`、`scikit-learn`；C-index 可选 `scikit-survival/lifelines`，没有则使用内置实现。推荐 Python 3.9+。无需安装 timm、einops、torch-geometric 或额外 CUDA 扩展。
 
 ```bash
 python -m unittest discover -s Prognosis/tests -v
 ```
 
 测试包括线性公式、稳定 NLL、MIL/临床反传、四种开关组合、三种融合、禁用输入不读取、临床列排除与未知类别、训练折时间/编码统计以及训练保存和推理一致性。均使用合成数据，不代表真实队列上的预测性能。
+
+新增测试覆盖全部 16 个编码器的单 patch/变长输入、关键参数梯度、适用模型的排列不变性、权重重载、真实长 bag 预算限制及 MIL 配置保存。CPU 合成测试通过不等于真实队列模型优劣结论。
